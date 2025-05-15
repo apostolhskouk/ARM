@@ -4,7 +4,7 @@ from src.retrieval.base import RetrievalResult
 from src.retrieval.dense import FaissDenseRetriever
 from src.utils.query_decompostion import QueryDecomposer
 from tqdm import tqdm
-
+USE_VLLM = False
 class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     """
     Extends FaissDenseRetriever to perform query decomposition before retrieval.
@@ -13,13 +13,13 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     def __init__(
         self,
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
-        ollama_model: str = "llama3.1:8b",
+        model_name: str = "llama3.1:8b",
         decomposition_cache_folder: Optional[str] = None
     ):
         super().__init__(model_name_or_path=embedding_model_name)
         try:
             self.decomposer = QueryDecomposer(
-                ollama_model=ollama_model,
+                model_name,
                 output_folder=decomposition_cache_folder
             )
         except Exception as e:
@@ -40,17 +40,33 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         if not nlqs:
             return []
 
-        # 1. Decompose all queries first (Keep this part the same)
-        all_sub_queries: List[str] = []
-        original_query_indices: List[int] = []
-        sub_query_groups: List[List[str]] = []
+        if USE_VLLM:
+            decomposed_nlqs_batch: List[List[str]] = self.decomposer.decompose_batch(nlqs)
+    
+            all_sub_queries: List[str] = []
+            original_query_indices: List[int] = []
+            sub_query_groups: List[List[str]] = [] 
 
-        for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
-            sub_queries = self.decomposer.decompose(nlq) or [nlq]
-            sub_query_groups.append(sub_queries)
-            for sub_q in sub_queries:
-                all_sub_queries.append(sub_q)
-                original_query_indices.append(i)
+            for i, single_nlq_decompositions in enumerate(decomposed_nlqs_batch):
+                current_s_queries = single_nlq_decompositions if single_nlq_decompositions else [nlqs[i]]
+                sub_query_groups.append(current_s_queries)
+
+                for sub_q in current_s_queries:
+                    all_sub_queries.append(sub_q)
+                    original_query_indices.append(i)
+
+        else:
+    
+            all_sub_queries: List[str] = []
+            original_query_indices: List[int] = []
+            sub_query_groups: List[List[str]] = []
+
+            for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
+                sub_queries = self.decomposer.decompose(nlq) or [nlq]
+                sub_query_groups.append(sub_queries)
+                for sub_q in sub_queries:
+                    all_sub_queries.append(sub_q)
+                    original_query_indices.append(i)
 
         if not all_sub_queries:
             return [[] for _ in nlqs]

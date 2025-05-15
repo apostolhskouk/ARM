@@ -150,4 +150,42 @@ class EvaluationMetrics:
         ax.legend(title="Metrics")
         plt.tight_layout()
         plt.show()
+    def calculate_metrics_for_single_n(
+        self,
+        ground_truth_ids: List[List[str]],
+        predicted_ids: List[List[str]],
+        n_value: int
+    ) -> Dict[str, float]:
+        if len(ground_truth_ids) != len(predicted_ids):
+            raise ValueError("Ground truth and predicted lists must have the same length.")
+
+        num_instances = len(ground_truth_ids)
+        if num_instances == 0:
+            return {"Precision": 0.0, "Recall": 0.0, "F1": 0.0, "Perfect Recall": 0.0}
+
+        instance_metrics_list: List[Dict[str, float]] = []
+
+        for i in range(num_instances):
+            gt_ids_instance = ground_truth_ids[i]
+            pred_ids_instance = predicted_ids[i]
+
+            unique_gt_set: Set[str] = set(gt_ids_instance)
+            unique_ordered_pred: List[str] = self._get_unique_ordered(pred_ids_instance)
+
+            instance_metrics = self._calculate_single_instance_metrics_at_n(
+                unique_gt_set, unique_ordered_pred, n_value
+            )
+            instance_metrics_list.append(instance_metrics)
+
+        avg_precision = sum(m['precision'] for m in instance_metrics_list) / num_instances if num_instances > 0 else 0.0
+        avg_recall = sum(m['recall'] for m in instance_metrics_list) / num_instances if num_instances > 0 else 0.0
+        avg_f1 = sum(m['f1'] for m in instance_metrics_list) / num_instances if num_instances > 0 else 0.0
+        avg_perfect_recall = sum(m['perfect_recall'] for m in instance_metrics_list) / num_instances if num_instances > 0 else 0.0
+
+        return {
+            "Precision": avg_precision,
+            "Recall": avg_recall,
+            "F1": avg_f1,
+            "Perfect Recall": avg_perfect_recall,
+        }
 # --- End of Base Class ---

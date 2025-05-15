@@ -23,6 +23,13 @@ class FeverousEvaluation(EvaluationMetrics):
         self.table_index_regex = re.compile(
             r"_(?:cell|header_cell|table_caption)_(\d+).*"
         )
+        self.last_gt_exact: Optional[List[List[str]]] = None
+        self.last_gt_table_page: Optional[List[List[str]]] = None
+        self.last_gt_page: Optional[List[List[str]]] = None
+        self.last_pred_exact: Optional[List[List[str]]] = None
+        self.last_pred_table_page: Optional[List[List[str]]] = None
+        self.last_pred_page: Optional[List[List[str]]] = None
+
 
 
     def _get_representative_gt_id(self, evidence_id: str) -> Optional[Tuple[str, str]]:
@@ -163,18 +170,14 @@ class FeverousEvaluation(EvaluationMetrics):
 
         try:
             with open(data_path, 'r', encoding='utf-8') as f:
-                # Changed from json.loads(line) to json.load(f) for single JSON array format
                 feverous_data = json.load(f)
         except json.JSONDecodeError as e:
-            # Provide more context for JSON decoding errors
             raise ValueError(f"Error decoding JSON file '{json_path}': {e}. Ensure it's a valid JSON array.") from e
         except Exception as e:
             raise RuntimeError(f"Error reading file {json_path}: {e}")
 
-        # Validate that feverous_data is a list
         if not isinstance(feverous_data, list):
              raise ValueError(f"Error: Expected a JSON list (array) in {json_path}, but got type {type(feverous_data)}.")
-
 
         if len(feverous_data) != len(predictions):
             raise ValueError(
@@ -182,24 +185,15 @@ class FeverousEvaluation(EvaluationMetrics):
                 f"number of prediction lists ({len(predictions)})."
             )
 
-        # Keep print statements minimal as requested previously
-        # print("Parsing ground truth...")
         gt_exact, gt_table_page, gt_page = self._get_ground_truth_lists(feverous_data)
-
-        # print("Parsing predictions...")
         pred_exact, pred_table_page, pred_page = self._get_prediction_lists(predictions)
 
-        # print("\nCalculating 'Exact Sentence / Table ID' metrics...")
+        self.last_gt_exact, self.last_gt_table_page, self.last_gt_page = gt_exact, gt_table_page, gt_page
+        self.last_pred_exact, self.last_pred_table_page, self.last_pred_page = pred_exact, pred_table_page, pred_page
+
         self.results_exact_sentence_table = self.calculate_metrics(gt_exact, pred_exact)
-        # print(self.results_exact_sentence_table)
-
-        # print("\nCalculating 'Table ID + Page ID (for Sentence)' metrics...")
         self.results_table_page = self.calculate_metrics(gt_table_page, pred_table_page)
-        # print(self.results_table_page)
-
-        # print("\nCalculating 'Page ID' metrics...")
         self.results_page = self.calculate_metrics(gt_page, pred_page)
-        # print(self.results_page)
 
         return {
             "exact_sentence_table": self.results_exact_sentence_table,

@@ -38,7 +38,7 @@ REACT_LLM_MODEL_PATH = "assets/cache/Qwen2.5-32B-Instruct-Q4_K_M.gguf"
 EMBEDDING_MODEL_NAME = "WhereIsAI/UAE-Large-V1"
 RERANKER_MODEL_NAME = "mixedbread-ai/mxbai-rerank-base-v2"
 OLLAMA_MODEL = "llama3.1:8b"
-
+VLLM_MODEL = "Qwen/Qwen3-32B" 
 # Helper to get index path
 def get_output_folder(base_dir: Path, level: str, retriever_instance: BaseRetriever, model_name: str) -> Path:
     """Determines the index output folder based on retriever type and level."""
@@ -98,8 +98,8 @@ if __name__ == "__main__":
         retriever_instances = {
             #"BM25": lambda: PyseriniBM25Retriever(),
             #"Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
-            "Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
+            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
             #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
             #"ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
         }
