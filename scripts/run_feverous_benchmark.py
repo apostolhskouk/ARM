@@ -15,7 +15,7 @@ import wandb
 import traceback
 from src.retrieval.react import ReActRetriever # Assuming ReActRetriever is in this location
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_compact.json") # Use Path object
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark.json") # Use Path object
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
@@ -96,12 +96,12 @@ if __name__ == "__main__":
         print("\n--- Initializing Retrievers ---")
         retrievers_for_level: List[BaseRetriever] = []
         retriever_instances = {
-            "BM25": lambda: PyseriniBM25Retriever(),
-            "Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
+            #"BM25": lambda: PyseriniBM25Retriever(),
+            #"Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
             "Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            "Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            "ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
+            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
         }
 
         for name, init_func in retriever_instances.items():
@@ -210,56 +210,59 @@ if __name__ == "__main__":
 
                     # --- Log Evaluation Metrics (Conditional Logging) ---
                     if isinstance(retriever, ReActRetriever):
-                        # --- ReAct Logging: Single Combined Table ---
-                        react_table_data = []
-                        # Retrieve metrics calculated earlier
-                        avg_distinct = react_specific_metrics.get("avg_distinct_retrieved_objects", None)
-                        avg_calls = react_specific_metrics.get("avg_llm_search_calls", None)
+                        avg_distinct_retrieved = react_specific_metrics.get("avg_distinct_retrieved_objects")
+                        avg_llm_calls = react_specific_metrics.get("avg_llm_search_calls")
 
-                        for eval_level_name, df in evaluation_output.items():
-                            if isinstance(df, pd.DataFrame) and not df.empty:
-                                # Iterate through each row (@N value) of the DataFrame
-                                for n_value, row_data in df.iterrows():
-                                    log_entry = {
-                                        "Eval Level": eval_level_name,
-                                        "@N": n_value,
-                                        "Precision": row_data.get('Precision', float('nan')),
-                                        "Recall": row_data.get('Recall', float('nan')),
-                                        "F1": row_data.get('F1', float('nan')),
-                                        "Perfect Recall": row_data.get('Perfect Recall', float('nan')),
-                                        # Add ReAct metrics to each row
-                                        "Avg Distinct Retrieved": avg_distinct,
-                                        "Avg LLM Calls": avg_calls
+                        if avg_distinct_retrieved is not None and avg_llm_calls is not None:
+                            k_for_eval = max(1, int(round(avg_distinct_retrieved)))
+
+                            gt_lists_map = {
+                                "exact_sentence_table": evaluator.last_gt_exact,
+                                "table_page": evaluator.last_gt_table_page,
+                                "page": evaluator.last_gt_page,
+                            }
+                            pred_lists_map = {
+                                "exact_sentence_table": evaluator.last_pred_exact,
+                                "table_page": evaluator.last_pred_table_page,
+                                "page": evaluator.last_pred_page,
+                            }
+
+                            for eval_level_name in ["exact_sentence_table", "table_page", "page"]:
+                                current_gt_list = gt_lists_map.get(eval_level_name)
+                                current_pred_list = pred_lists_map.get(eval_level_name)
+
+                                if current_gt_list is not None and current_pred_list is not None:
+                                    metrics_at_k_for_eval = evaluator.calculate_metrics_for_single_n(
+                                        ground_truth_ids=current_gt_list,
+                                        predicted_ids=current_pred_list,
+                                        n_value=k_for_eval
+                                    )
+
+                                    react_custom_df_data = {
+                                        "#calls ↓": [avg_llm_calls],
+                                        "Avg #obj. ↓": [avg_distinct_retrieved],
+                                        "P": [metrics_at_k_for_eval.get("Precision", 0.0) * 100.0],
+                                        "R": [metrics_at_k_for_eval.get("Recall", 0.0) * 100.0],
+                                        "F1": [metrics_at_k_for_eval.get("F1", 0.0) * 100.0],
+                                        "PR": [metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0],
                                     }
-                                    # Add other columns if they exist in the eval output df
-                                    if 'Perc_Preds_Less_Than_n' in row_data:
-                                        log_entry['Perc_Preds_Less_Than_n'] = row_data['Perc_Preds_Less_Than_n']
+                                    react_custom_df = pd.DataFrame(react_custom_df_data)
+                                    column_order = ["#calls ↓", "Avg #obj. ↓", "P", "R", "F1", "PR"]
+                                    react_custom_df = react_custom_df[column_order]
 
-                                    react_table_data.append(log_entry)
+                                    wandb.log({
+                                        f"react_summary_table/{eval_level_name}": wandb.Table(dataframe=react_custom_df)
+                                    })
 
-                        if react_table_data:
-                            react_summary_df = pd.DataFrame(react_table_data)
-                            wandb.log({
-                                f"react_evaluation_summary_table": wandb.Table(dataframe=react_summary_df) # Use a consistent name across levels or include level: f"react_evaluation_summary_table_{index_level}"
-                            })
-                        else:
-                             print("Warning: No data generated for ReAct summary table.")
-                             wandb.log({"warning": "No data for ReAct summary table"})
-
-                        # Optionally log key summary metrics as scalars for easier comparison
-                        summary_metrics = {}
-                        # Example: Log metrics for the highest N value or K_RESULTS
-                        chosen_n_for_summary = EVALUATION_N_VALUES[-1] # Or use K_RESULTS if preferred and available
-                        for eval_level_name, df in evaluation_output.items():
-                            if isinstance(df, pd.DataFrame) and not df.empty and chosen_n_for_summary in df.index:
-                                summary_metrics[f"eval_{eval_level_name}_Precision@{chosen_n_for_summary}"] = df.loc[chosen_n_for_summary, 'Precision']
-                                summary_metrics[f"eval_{eval_level_name}_Recall@{chosen_n_for_summary}"] = df.loc[chosen_n_for_summary, 'Recall']
-                                summary_metrics[f"eval_{eval_level_name}_F1@{chosen_n_for_summary}"] = df.loc[chosen_n_for_summary, 'F1']
-                                summary_metrics[f"eval_{eval_level_name}_PerfectRecall@{chosen_n_for_summary}"] = df.loc[chosen_n_for_summary, 'Perfect Recall']
-                        if summary_metrics:
-                           wandb.log(summary_metrics)
-
-
+                                    wandb.log({
+                                        f"react_{eval_level_name}_avg_calls": avg_llm_calls,
+                                        f"react_{eval_level_name}_avg_obj": avg_distinct_retrieved,
+                                        f"react_{eval_level_name}_P_at_avg_obj": metrics_at_k_for_eval.get("Precision", 0.0) * 100.0,
+                                        f"react_{eval_level_name}_R_at_avg_obj": metrics_at_k_for_eval.get("Recall", 0.0) * 100.0,
+                                        f"react_{eval_level_name}_F1_at_avg_obj": metrics_at_k_for_eval.get("F1", 0.0) * 100.0,
+                                        f"react_{eval_level_name}_PR_at_avg_obj": metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0,
+                                    })
+                                    
                     else:
                         # --- Standard Logging: Multiple Tables ---
                         metrics_to_log = {}
