@@ -14,7 +14,7 @@ class DenseRetrieverWithReranker(FaissDenseRetriever):
         self,
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
         reranker_model_name: str = "mixedbread-ai/mxbai-rerank-large-v2",
-        k_multiplier: int = 1
+        k_multiplier: int = 3
     ):
         super().__init__(model_name_or_path=embedding_model_name,)
         self.reranker = MxbaiRerankV2(reranker_model_name,device_map="cuda:1" )
