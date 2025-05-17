@@ -70,7 +70,8 @@ class ARMRetriever(BaseRetriever):
         self.trie_min_n = trie_min_n
         self.trie_max_n = trie_max_n
         self.indexed_field: Optional[str] = None
-
+        self.actual_trie_file_path: Optional[str] = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.llm_model = models.LlamaCpp(
             self.llm_model_path,
@@ -78,7 +79,8 @@ class ARMRetriever(BaseRetriever):
             n_ctx=self.llm_n_ctx,
             echo=self.verbose_llm
         )
-        self.embedding_model = SentenceTransformer(self.embedding_model_name)
+        self.embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
+
 
         self.bm25_retriever = bm25_retriever_instance if bm25_retriever_instance else PyseriniBM25Retriever()
         self.faiss_dense_retriever = faiss_retriever_instance if faiss_retriever_instance else FaissDenseRetriever(model_name_or_path=self.embedding_model_name)
@@ -223,10 +225,17 @@ class ARMRetriever(BaseRetriever):
         return {"name": table_name, "columns": columns_data}
 
     @staticmethod
-    def _get_tokens(text: str) -> Set[str]:
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', '', text)
-        return set(text.split())
+    def _get_tokens_cached(text: str, cache: Dict[str, Set[str]]) -> Set[str]:
+        if text in cache:
+            return cache[text]
+        processed_text = text.lower()
+        processed_text = re.sub(r'[^\w\s]', '', processed_text)
+        tokens = set(processed_text.split())
+        cache[text] = tokens
+        return tokens
+
+    def _get_tokens(self, text: str) -> Set[str]:
+        return ARMRetriever._get_tokens_cached(text, {})
 
     @staticmethod
     def _jaccard_similarity(set1: Set[str], set2: Set[str]) -> float:
@@ -244,12 +253,95 @@ class ARMRetriever(BaseRetriever):
         min_len = min(len(set1), len(set2))
         return intersection / min_len if min_len > 0 else 0.0
 
+    def _get_semantic_similarity_from_embeddings(self, emb1: Optional[torch.Tensor], emb2: Optional[torch.Tensor]) -> float:
+        if emb1 is None or emb2 is None or emb1.nelement() == 0 or emb2.nelement() == 0:
+            return 0.0
+        
+        current_emb1 = emb1.to(self.device) if emb1.device != self.device else emb1
+        current_emb2 = emb2.to(self.device) if emb2.device != self.device else emb2
+
+        if current_emb1.ndim == 1: current_emb1 = current_emb1.unsqueeze(0)
+        if current_emb2.ndim == 1: current_emb2 = current_emb2.unsqueeze(0)
+        
+        return util.cos_sim(current_emb1, current_emb2).item()
+    
     def _get_semantic_similarity(self, text1: str, text2: str) -> float:
         emb1 = self.embedding_model.encode(text1, convert_to_tensor=True, show_progress_bar=False)
         emb2 = self.embedding_model.encode(text2, convert_to_tensor=True, show_progress_bar=False)
-        if emb1.nelement() == 0 or emb2.nelement() == 0: return 0.0
-        return util.cos_sim(emb1, emb2).item()
+        return self._get_semantic_similarity_from_embeddings(emb1, emb2)
+    def _calculate_table_table_compatibility_optimized(
+        self, table1_parsed: dict, table2_parsed: dict, 
+        embeddings_map: Dict[str, torch.Tensor], tokens_cache: Dict[str, Set[str]]
+    ) -> float:
+        max_col_pair_compatibility = 0.0
+        table1_headers = list(table1_parsed["columns"].keys())
+        table2_headers = list(table2_parsed["columns"].keys())
+        if not table1_headers or not table2_headers: return 0.0
 
+        for h1 in table1_headers:
+            emb_h1 = embeddings_map.get(h1)
+            if emb_h1 is None: continue
+            for h2 in table2_headers:
+                emb_h2 = embeddings_map.get(h2)
+                if emb_h2 is None: continue
+
+                header_sem_sim = self._get_semantic_similarity_from_embeddings(emb_h1, emb_h2)
+                
+                col1_value_tokens = set()
+                for v_val in table1_parsed["columns"].get(h1, []): 
+                    col1_value_tokens.update(ARMRetriever._get_tokens_cached(v_val, tokens_cache))
+                col2_value_tokens = set()
+                for v_val in table2_parsed["columns"].get(h2, []): 
+                    col2_value_tokens.update(ARMRetriever._get_tokens_cached(v_val, tokens_cache))
+                
+                exact_val_sim = self._jaccard_similarity(col1_value_tokens, col2_value_tokens)
+                col_pair_comp = (self.compatibility_semantic_weight * header_sem_sim +
+                                 self.compatibility_exact_weight * exact_val_sim)
+                if col_pair_comp > max_col_pair_compatibility:
+                    max_col_pair_compatibility = col_pair_comp
+        return max_col_pair_compatibility
+
+    def _calculate_table_passage_compatibility_optimized(
+        self, table_parsed: dict, passage_text: str, passage_embedding: Optional[torch.Tensor], 
+        embeddings_map: Dict[str, torch.Tensor], tokens_cache: Dict[str, Set[str]]
+    ) -> float:
+        max_cell_sentence_compatibility = 0.0
+        if not table_parsed["columns"] or passage_embedding is None: return 0.0
+        
+        passage_tokens = ARMRetriever._get_tokens_cached(passage_text, tokens_cache)
+
+        for header, cells in table_parsed["columns"].items():
+            for cell_content in cells:
+                emb_cell = embeddings_map.get(cell_content)
+                if emb_cell is None: continue
+
+                cell_sem_sim = self._get_semantic_similarity_from_embeddings(emb_cell, passage_embedding)
+                
+                cell_tokens = ARMRetriever._get_tokens_cached(cell_content, tokens_cache)
+                exact_val_sim = self._overlap_coefficient(cell_tokens, passage_tokens)
+                cell_sentence_comp = (self.compatibility_semantic_weight * cell_sem_sim +
+                                      self.compatibility_exact_weight * exact_val_sim)
+                if cell_sentence_comp > max_cell_sentence_compatibility:
+                    max_cell_sentence_compatibility = cell_sentence_comp
+        return max_cell_sentence_compatibility
+
+    def _calculate_passage_passage_compatibility_optimized(
+        self, passage1_text: str, passage1_embedding: Optional[torch.Tensor], 
+        passage2_text: str, passage2_embedding: Optional[torch.Tensor],
+        tokens_cache: Dict[str, Set[str]]
+    ) -> float:
+        if passage1_embedding is None or passage2_embedding is None: return 0.0
+        
+        sem_sim = self._get_semantic_similarity_from_embeddings(passage1_embedding, passage2_embedding)
+        
+        passage1_tokens = ARMRetriever._get_tokens_cached(passage1_text, tokens_cache)
+        passage2_tokens = ARMRetriever._get_tokens_cached(passage2_text, tokens_cache)
+        
+        exact_val_sim = self._overlap_coefficient(passage1_tokens, passage2_tokens)
+        return (self.compatibility_semantic_weight * sem_sim +
+                self.compatibility_exact_weight * exact_val_sim)
+        
+        
     def _calculate_table_table_compatibility(self, table1_parsed: dict, table2_parsed: dict) -> float:
         max_col_pair_compatibility = 0.0
         table1_headers = list(table1_parsed["columns"].keys())
@@ -303,87 +395,132 @@ class ARMRetriever(BaseRetriever):
         
         min_tables_needed = 0
         min_passages_needed = 0
-
         if effective_k_select > 0:
             num_available_tables = len(table_indices)
             num_available_passages = len(passage_indices)
-
             if num_available_tables + num_available_passages < effective_k_select:
                  effective_k_select = num_available_tables + num_available_passages
-
-
             ideal_tables = effective_k_select // 2
             ideal_passages = effective_k_select - ideal_tables
-
             min_tables_needed = min(ideal_tables, num_available_tables)
             min_passages_needed = min(ideal_passages, num_available_passages)
-
             if min_tables_needed + min_passages_needed < effective_k_select:
                 if min_tables_needed < ideal_tables and num_available_tables > min_tables_needed:
                     min_tables_needed = min(num_available_tables, min_tables_needed + (effective_k_select - (min_tables_needed + min_passages_needed)))
                 if min_passages_needed < ideal_passages and num_available_passages > min_passages_needed:
                      min_passages_needed = min(num_available_passages, min_passages_needed + (effective_k_select - (min_tables_needed + min_passages_needed)))
-
-        start = time.time()
-        tt_time = tp_time = pp_time = 0.0
+        
+        mip_setup_start_time = time.time()
         R = [obj['relevance_score_R_i'] for obj in candidate_objects]
         C = np.zeros((num_objects, num_objects))
+
+        all_texts_for_embedding = set()
+        for obj in candidate_objects:
+            if obj['source_type'] == 'table' and obj['parsed_content']:
+                for header in obj['parsed_content']['columns'].keys():
+                    all_texts_for_embedding.add(header)
+                for cell_list in obj['parsed_content']['columns'].values():
+                    for cell_content in cell_list:
+                        all_texts_for_embedding.add(cell_content)
+            elif obj['source_type'] == 'passage':
+                all_texts_for_embedding.add(obj['text'])
+        
+        unique_texts_list = list(all_texts_for_embedding)
+        text_to_embedding_map: Dict[str, torch.Tensor] = {}
+
+        if unique_texts_list:
+            # Determine batch size dynamically or make it configurable
+            batch_size = 32 if self.device.type == 'cpu' else 128 
+            all_embeddings = self.embedding_model.encode(
+                unique_texts_list, 
+                convert_to_tensor=True, 
+                show_progress_bar=False, # Can be set to False for less verbose output
+                batch_size=batch_size 
+            )
+            for text, embedding_tensor in zip(unique_texts_list, all_embeddings):
+                text_to_embedding_map[text] = embedding_tensor # Already on self.device from encode
+
+        tokens_cache_for_mip: Dict[str, Set[str]] = {}
+
+        tt_time = tp_time = pp_time = 0.0
         for i in range(num_objects):
             for j in range(i + 1, num_objects):
                 obj_i = candidate_objects[i]; obj_j = candidate_objects[j]
                 comp_val = 0.0
+                
                 if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
                     if obj_i['parsed_content'] and obj_j['parsed_content']:
                         t0 = time.time()
-                        comp_val = self._calculate_table_table_compatibility(obj_i['parsed_content'], obj_j['parsed_content'])
+                        comp_val = self._calculate_table_table_compatibility_optimized(
+                            obj_i['parsed_content'], obj_j['parsed_content'], 
+                            text_to_embedding_map, tokens_cache_for_mip)
                         tt_time += time.time() - t0
                 elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
                     if obj_i['parsed_content']:
                         t0 = time.time()
-                        comp_val = self._calculate_table_passage_compatibility(obj_i['parsed_content'], obj_j['text'])
+                        passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
+                        comp_val = self._calculate_table_passage_compatibility_optimized(
+                            obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
+                            text_to_embedding_map, tokens_cache_for_mip)
                         tp_time += time.time() - t0
                 elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
                     if obj_j['parsed_content']:
                         t0 = time.time()
-                        comp_val = self._calculate_table_passage_compatibility(obj_j['parsed_content'], obj_i['text'])
+                        passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
+                        comp_val = self._calculate_table_passage_compatibility_optimized(
+                            obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
+                            text_to_embedding_map, tokens_cache_for_mip)
                         tp_time += time.time() - t0
                 elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
                     t0 = time.time()
-                    comp_val = self._calculate_passage_passage_compatibility(obj_i['text'], obj_j['text'])
+                    passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
+                    passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
+                    comp_val = self._calculate_passage_passage_compatibility_optimized(
+                        obj_i['text'], passage_i_embedding, 
+                        obj_j['text'], passage_j_embedding,
+                        tokens_cache_for_mip)
                     pp_time += time.time() - t0
                 C[i, j] = C[j, i] = comp_val
 
-        end = time.time()
-        print(f"Time taken for MIP setup: {end - start:.2f} seconds")
-        print(f"Table-Table compatibility time: {tt_time:.2f} seconds")
-        print(f"Table-Passage compatibility time: {tp_time:.2f} seconds")
-        print(f"Passage-Passage compatibility time: {pp_time:.2f} seconds")
+        mip_C_matrix_time = time.time() - mip_setup_start_time
+        print(f"Time taken for MIP C matrix setup: {mip_C_matrix_time:.2f} seconds")
+        print(f"  Table-Table compatibility calculation time: {tt_time:.2f} seconds")
+        print(f"  Table-Passage compatibility calculation time: {tp_time:.2f} seconds")
+        print(f"  Passage-Passage compatibility calculation time: {pp_time:.2f} seconds")
         
+        prob_solve_start_time = time.time()
         prob = LpProblem("ObjectSelectionMIP", LpMaximize)
         b = [LpVariable(f"b_{i}", cat=LpBinary) for i in range(num_objects)]
         c_vars = {}
         for i in range(num_objects):
             for j in range(i + 1, num_objects):
-                c_vars[(i,j)] = LpVariable(f"c_{i}_{j}", cat=LpBinary)
+                if C[i][j] > 1e-6: # Only create var if C[i][j] is meaningfully positive
+                     c_vars[(i,j)] = LpVariable(f"c_{i}_{j}", cat=LpBinary)
 
-        prob += lpSum(R[i] * b[i] for i in range(num_objects)) + \
-                (lpSum(C[i][j] * c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if C[i][j] > 0) if c_vars else 0)
+        objective = lpSum(R[i] * b[i] for i in range(num_objects))
+        if c_vars: 
+            objective += lpSum(C[i][j] * c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars)
+        prob += objective
 
         prob += lpSum(b[i] for i in range(num_objects)) == effective_k_select, "TotalObjectsConstraint"
-        if effective_k_select > 1 and c_vars:
-             prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects)) <= 2 * (effective_k_select - 1), "MaxConnectionsConstraint"
-        elif effective_k_select == 1 and c_vars:
-             prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects)) == 0, "NoConnectionsForK1Constraint"
         if c_vars:
+            if effective_k_select > 1:
+                 prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars) <= 2 * (effective_k_select - 1), "MaxConnectionsConstraint"
+            elif effective_k_select == 1: 
+                 prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars) == 0, "NoConnectionsForK1Constraint"
+            
             for i in range(num_objects):
                 for j in range(i + 1, num_objects):
-                    prob += 2 * c_vars[(i,j)] <= b[i] + b[j], f"ConnectionIntegrity_{i}_{j}"
+                    if (i,j) in c_vars: 
+                        prob += 2 * c_vars[(i,j)] <= b[i] + b[j], f"ConnectionIntegrity_{i}_{j}"
+        
         if table_indices and min_tables_needed > 0:
             prob += lpSum(b[i] for i in table_indices) >= min_tables_needed, "MinTablesConstraint"
         if passage_indices and min_passages_needed > 0:
             prob += lpSum(b[i] for i in passage_indices) >= min_passages_needed, "MinPassagesConstraint"
 
-        prob.solve(PULP_CBC_CMD(msg=0, timeLimit=30)) # Added timeLimit
+        prob.solve(PULP_CBC_CMD(msg=0, timeLimit=30))
+        prob_solve_time = time.time() - prob_solve_start_time
         
         selected_objects_indices = []
         if prob.status == 1: 
@@ -477,13 +614,19 @@ class ARMRetriever(BaseRetriever):
         The relevant keywords are: """)
     
     @guidance(stateless=False)
-    def _perform_arm_retrieval_for_query(self, lm, user_query: str):
-        start_total = time.time()
+    def _perform_arm_retrieval_for_query(self, lm, user_query: str): # lm is the guidance model state
+        start_total_time = time.time()
         lm += self._get_initial_prompt_string(user_query)
+        
+        # Keyword Generation (LLM)
+        kw_gen_start_time = time.time()
         lm += gen(name='keywords_str', stop='\n', max_tokens=150)
-        start_kw = time.time()
         keywords_str = lm['keywords_str'].strip()
         keywords = [k.strip() for k in keywords_str.split('|') if k.strip()][:self.max_keywords_per_query]
+        kw_gen_time = time.time() - kw_gen_start_time
+
+        # N-gram Generation (LLM with Trie-constrained selection)
+        ngram_gen_start_time = time.time()
         lm += "\nThe relevant n-grams are:"
         all_parsed_ngrams_for_bm25_queries = []
         for keyword_idx, keyword in enumerate(keywords):
@@ -494,185 +637,265 @@ class ARMRetriever(BaseRetriever):
             keyword_ngram_generation_finished = False
             for rephrase_num in range(self.max_rephrases):
                 first_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_first_token"
-                lm += gen(name=first_token_var, max_tokens=1)
+                lm += gen(name=first_token_var, max_tokens=1, stop=[')', ','])
+                
                 if lm[first_token_var] == ')':
                     keyword_ngram_generation_finished = True; break
+                if lm[first_token_var] == ',':
+                    if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                    current_ngram_being_built_in_python = ""
+                    if rephrase_num < self.max_rephrases -1 : lm += " "
+                    break 
+
                 current_ngram_being_built_in_python = lm[first_token_var]
-                if len(current_ngram_being_built_in_python) < 2 and lm[first_token_var] != ' ':
-                    second_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_second_token"
-                    lm += gen(name=second_token_var, max_tokens=1)
-                    if lm[second_token_var] == ')':
-                        if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-                        current_ngram_being_built_in_python = ""; keyword_ngram_generation_finished = True; break
-                    current_ngram_being_built_in_python += lm[second_token_var]
-                for token_step in range(self.max_keyword_length):
-                    continuations = find_next_word_continuations(current_ngram_being_built_in_python, self.actual_trie_file_path)
-                    valid_next_strings = continuations + [')', ', ']
-                    if ' ' not in continuations and (not current_ngram_being_built_in_python or current_ngram_being_built_in_python[-1] != ' '):
-                        valid_next_strings.append(' ')
-                    valid_next_strings = list(set(s for s in valid_next_strings if s and s != '|'))
-                    if not valid_next_strings: valid_next_strings = [')', ', ', ' ']
-                    valid_next_strings = self.configure_list_size(valid_next_strings, 2000)
-                    if not valid_next_strings: valid_next_strings = [')']
-                    current_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_token_{token_step}"
-                    lm += select(options=valid_next_strings, name=current_token_var)
-                    selected_token_str = lm[current_token_var]
-                    if selected_token_str == ')':
-                        if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-                        current_ngram_being_built_in_python = ""; keyword_ngram_generation_finished = True; break
-                    elif selected_token_str == ', ':
-                        if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-                        current_ngram_being_built_in_python = ""
-                        if rephrase_num < self.max_rephrases - 1: lm += " "
-                        break
-                    else: current_ngram_being_built_in_python += selected_token_str
-                if keyword_ngram_generation_finished: break
-            if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-            if ngrams_for_this_keyword_list: all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
-        end_kw = time.time(); print(f"Keyword generation time: {end_kw - start_kw}")
+                
+                if lm[first_token_var] not in [')', ',']:
+                    for token_step in range(self.max_keyword_length -1): 
+                        continuations = find_next_word_continuations(current_ngram_being_built_in_python, self.actual_trie_file_path)
+                        valid_next_strings = continuations + [')', ', '] 
+                        if ' ' not in continuations and (not current_ngram_being_built_in_python or current_ngram_being_built_in_python[-1] != ' '):
+                            valid_next_strings.append(' ') 
+                        
+                        valid_next_strings = list(set(s for s in valid_next_strings if s and s != '|')) 
+                        if not valid_next_strings: valid_next_strings = [')', ', ', ' '] 
+                        
+                        valid_next_strings = self.configure_list_size(valid_next_strings, self.max_trie_continuations)
+                        if not valid_next_strings: valid_next_strings = [')'] 
+
+                        current_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_token_{token_step}"
+                        lm += select(options=valid_next_strings, name=current_token_var)
+                        selected_token_str = lm[current_token_var]
+
+                        if selected_token_str == ')':
+                            if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                            current_ngram_being_built_in_python = ""; keyword_ngram_generation_finished = True; break 
+                        elif selected_token_str == ', ':
+                            if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                            current_ngram_being_built_in_python = ""
+                            if rephrase_num < self.max_rephrases -1 : lm += " " 
+                            break 
+                        else:
+                            current_ngram_being_built_in_python += selected_token_str
+                
+                if keyword_ngram_generation_finished: break 
+            
+            if current_ngram_being_built_in_python.strip(): 
+                ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+            
+            if ngrams_for_this_keyword_list:
+                all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
+            
+            if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 :
+                 lm += ")" 
+
+        ngram_gen_time = time.time() - ngram_gen_start_time
+        print(f"LLM Keyword generation time: {kw_gen_time:.2f}s, N-gram generation time: {ngram_gen_time:.2f}s")
+
+        # Initial Retrieval (BM25 and FAISS)
+        retrieval_start_time = time.time()
         retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
-        start_bm25 = time.time()
         if all_parsed_ngrams_for_bm25_queries and self.bm25_index_path and os.path.exists(self.bm25_index_path):
             retrieved_docs_by_bm25_nested = self.bm25_retriever.retrieve(
                 nlqs=all_parsed_ngrams_for_bm25_queries,
-                output_folder=self.bm25_index_path,
+                output_folder=self.bm25_index_path, 
                 k=self.bm25_k_candidates
             )
+        else: 
+            retrieved_docs_by_bm25_nested = [[] for _ in all_parsed_ngrams_for_bm25_queries]
+
+        retrieved_docs_by_faiss: List[List[RetrievalResult]] = []
+        if self.faiss_index_path and os.path.exists(self.faiss_index_path): 
+            retrieved_docs_by_faiss = self.faiss_dense_retriever.retrieve(
+                nlqs=[user_query], 
+                output_folder=self.faiss_index_path, 
+                k=self.bm25_k_candidates 
+            )
+        else: 
+             retrieved_docs_by_faiss = [[]]
+
+        all_bm25_results_flat: List[RetrievalResult] = [item for sublist in retrieved_docs_by_bm25_nested for item in sublist]
+        faiss_results_for_query: List[RetrievalResult] = retrieved_docs_by_faiss[0] if retrieved_docs_by_faiss else []
         
-        
-        end_bm25 = time.time(); print(f"BM25 retrieval time: {end_bm25 - start_bm25}")
+        combined_initial_candidates = all_bm25_results_flat + faiss_results_for_query
+        retrieval_time = time.time() - retrieval_start_time
+        print(f"Initial BM25 & FAISS retrieval time: {retrieval_time:.2f}s. Candidates: {len(combined_initial_candidates)}")
+
         unique_retrieved_objects_map = {}
-        for result_list_for_query in retrieved_docs_by_bm25_nested:
-            for res_item in result_list_for_query:
-                doc_id = res_item.metadata.get('id', res_item.object)
-                if doc_id not in unique_retrieved_objects_map:
-                    unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_bm25_score': res_item.score, 'metadata': res_item.metadata}
-                else:
-                    unique_retrieved_objects_map[doc_id]['max_bm25_score'] = max(
-                        unique_retrieved_objects_map[doc_id]['max_bm25_score'], res_item.score
-                    )
+        for res_item in combined_initial_candidates:
+            doc_id = res_item.metadata.get('id', res_item.object) if isinstance(res_item.metadata, dict) else res_item.object
+            
+            if doc_id not in unique_retrieved_objects_map:
+                unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_score': res_item.score, 'metadata': res_item.metadata}
+            else: 
+                unique_retrieved_objects_map[doc_id]['max_score'] = max(
+                    unique_retrieved_objects_map[doc_id]['max_score'], res_item.score
+                )
+        
         if not unique_retrieved_objects_map:
-            lm += "Here are the objects that can be relevant to answer the user query:\nNo relevant objects found.\n"
-            lm += f"From the above objects, here are the IDs of those that are enough to answer the query:\nNo objects to select from.\n<>"
-            lm['final_chosen_objects_from_mip'] = []
+            lm += "\nHere are the objects that can be relevant to answer the user query:\nNo relevant objects found.\n"
+            lm += "From the above objects, here are the IDs of those that are enough to answer the query:\nNo objects to select from.\n<>"
+            lm.set('llm_final_selected_objects', [])
             return lm
-        start_embed = time.time()
-        query_embedding_np = self.embedding_model.encode(user_query, convert_to_numpy=True, show_progress_bar=False)
-        if query_embedding_np.ndim == 1: query_embedding_np = query_embedding_np.reshape(1, -1)
-        if query_embedding_np.size > 0: faiss.normalize_L2(query_embedding_np)
-        query_embedding_tensor = torch.tensor(query_embedding_np)
-        end_embed = time.time(); print(f"Query embedding time: {end_embed - start_embed}")
+
+        relevance_scoring_start_time = time.time()
+        query_embedding_tensor = self.embedding_model.encode(user_query, convert_to_tensor=True, show_progress_bar=False)
+        query_embedding_tensor = query_embedding_tensor.to(self.device)
+        if query_embedding_tensor.ndim == 1: query_embedding_tensor = query_embedding_tensor.unsqueeze(0)
+        
+        # Normalize query embedding if SBERT model doesn't do it by default and FAISS index is L2 normalized
+        # query_np_for_norm = query_embedding_tensor.cpu().numpy()
+        # if query_np_for_norm.size > 0: faiss.normalize_L2(query_np_for_norm)
+        # query_embedding_tensor = torch.tensor(query_np_for_norm).to(self.device)
+
+
         mip_input_candidates = []
-        can_use_faiss_embeddings = (self.faiss_index is not None and 
-                                    self.faiss_text_to_idx_map is not None and
-                                    len(self.faiss_text_to_idx_map) > 0)
-        text_to_similarity_score_map = {}
-        start_faiss = time.time()
-        if can_use_faiss_embeddings and query_embedding_np.size > 0 and self.faiss_index.ntotal > 0:
-            texts_for_faiss_lookup = []
-            original_items_for_faiss = []
-            for bm25_doc_id_key, data_item in unique_retrieved_objects_map.items():
-                bm25_object_text = data_item['doc'].object
-                if bm25_object_text in self.faiss_text_to_idx_map:
-                    original_faiss_idx = self.faiss_text_to_idx_map[bm25_object_text]
+        temp_relevance_scores: Dict[str, float] = {} # To store R_i for each unique object text
+
+        # Strategy for R_i:
+        # 1. Try to get similarity from FAISS index directly if object text is in faiss_text_to_idx_map
+        # 2. For remaining objects, batch encode their texts and calculate similarity.
+
+        texts_needing_fresh_encoding_for_Ri = []
+        map_text_to_data_item_for_Ri = {} # To link back after batch encoding
+
+        if self.faiss_index and self.faiss_text_to_idx_map and self.faiss_index.ntotal > 0:
+            candidate_faiss_indices = []
+            map_faiss_idx_to_text = {}
+
+            for doc_id, data_item in unique_retrieved_objects_map.items():
+                obj_text = data_item['doc'].object
+                if obj_text in self.faiss_text_to_idx_map:
+                    original_faiss_idx = self.faiss_text_to_idx_map[obj_text]
                     if 0 <= original_faiss_idx < self.faiss_index.ntotal:
-                        texts_for_faiss_lookup.append(bm25_object_text)
-                        original_items_for_faiss.append(data_item)
-            if texts_for_faiss_lookup:
-                reconstructed_embs_list = []
-                valid_original_items = []
-                for i, text_key in enumerate(texts_for_faiss_lookup):
-                    original_faiss_idx = self.faiss_text_to_idx_map[text_key]
-                    reconstructed_embs_list.append(self.faiss_index.reconstruct(original_faiss_idx))
-                    valid_original_items.append(original_items_for_faiss[i])
-                if reconstructed_embs_list:
-                    object_embeddings_np_stack = np.array(reconstructed_embs_list).astype('float32')
-                    if object_embeddings_np_stack.ndim == 1 and len(reconstructed_embs_list) == 1:
-                        object_embeddings_np_stack = object_embeddings_np_stack.reshape(1, -1)
-                    if object_embeddings_np_stack.size > 0:
-                        faiss.normalize_L2(object_embeddings_np_stack)
-                        object_embeddings_tensor = torch.tensor(object_embeddings_np_stack)
-                        if query_embedding_tensor.nelement() > 0 and object_embeddings_tensor.nelement() > 0:
-                            cosine_similarities_tensor = util.cos_sim(query_embedding_tensor, object_embeddings_tensor)[0]
-                            cosine_similarities_scores = cosine_similarities_tensor.tolist()
-                            for i, data_item in enumerate(valid_original_items):
-                                if i < len(cosine_similarities_scores):
-                                    text_key = data_item['doc'].object
-                                    text_to_similarity_score_map[text_key] = (cosine_similarities_scores[i] + 1) / 2.0
-        end_faiss = time.time(); print(f"FAISS similarity time: {end_faiss - start_faiss}")
-        for bm25_doc_id_key, data_item in unique_retrieved_objects_map.items():
+                        candidate_faiss_indices.append(original_faiss_idx)
+                        map_faiss_idx_to_text[original_faiss_idx] = obj_text
+                    else: # Index out of bounds, or text not actually in current FAISS index
+                        texts_needing_fresh_encoding_for_Ri.append(obj_text)
+                        map_text_to_data_item_for_Ri[obj_text] = data_item
+                else: # Text not in FAISS metadata map
+                    texts_needing_fresh_encoding_for_Ri.append(obj_text)
+                    map_text_to_data_item_for_Ri[obj_text] = data_item
+            
+            if candidate_faiss_indices:
+                reconstructed_embs_np = np.array([self.faiss_index.reconstruct(idx) for idx in candidate_faiss_indices]).astype('float32')
+                # if reconstructed_embs_np.size > 0: faiss.normalize_L2(reconstructed_embs_np) # Normalize if needed
+                
+                reconstructed_embs_tensor = torch.tensor(reconstructed_embs_np).to(self.device)
+                if query_embedding_tensor.nelement() > 0 and reconstructed_embs_tensor.nelement() > 0:
+                    sim_scores_tensor = util.cos_sim(query_embedding_tensor, reconstructed_embs_tensor)[0]
+                    for i, original_faiss_idx in enumerate(candidate_faiss_indices):
+                        obj_text = map_faiss_idx_to_text[original_faiss_idx]
+                        score = (sim_scores_tensor[i].item() + 1) / 2.0 # Normalize to 0-1
+                        temp_relevance_scores[obj_text] = score
+        else: # No FAISS index or map, all need fresh encoding
+            for doc_id, data_item in unique_retrieved_objects_map.items():
+                obj_text = data_item['doc'].object
+                texts_needing_fresh_encoding_for_Ri.append(obj_text)
+                map_text_to_data_item_for_Ri[obj_text] = data_item
+        
+        # Batch encode remaining texts for R_i
+        unique_texts_needing_Ri = list(set(texts_needing_fresh_encoding_for_Ri)) # Deduplicate
+        if unique_texts_needing_Ri:
+            print(f"Batch encoding {len(unique_texts_needing_Ri)} texts for R_i relevance scores...")
+            obj_embeddings_tensor = self.embedding_model.encode(
+                unique_texts_needing_Ri, convert_to_tensor=True, show_progress_bar=True, batch_size=128
+            )
+            obj_embeddings_tensor = obj_embeddings_tensor.to(self.device)
+            # obj_embeddings_np_for_norm = obj_embeddings_tensor.cpu().numpy()
+            # if obj_embeddings_np_for_norm.size > 0: faiss.normalize_L2(obj_embeddings_np_for_norm)
+            # obj_embeddings_tensor = torch.tensor(obj_embeddings_np_for_norm).to(self.device)
+
+            if query_embedding_tensor.nelement() > 0 and obj_embeddings_tensor.nelement() > 0:
+                sim_scores_tensor = util.cos_sim(query_embedding_tensor, obj_embeddings_tensor)[0]
+                for i, text_content in enumerate(unique_texts_needing_Ri):
+                    score = (sim_scores_tensor[i].item() + 1) / 2.0
+                    temp_relevance_scores[text_content] = score
+        
+        # Construct MIP input candidates using the calculated R_i scores
+        for doc_id, data_item in unique_retrieved_objects_map.items():
             doc_object_text = data_item['doc'].object
-            relevance_score_R_i = 0.0
-            if doc_object_text in text_to_similarity_score_map:
-                relevance_score_R_i = text_to_similarity_score_map[doc_object_text]
-            elif query_embedding_tensor.nelement() > 0 :
-                obj_emb = self.embedding_model.encode(doc_object_text, convert_to_tensor=True, show_progress_bar=False)
-                if obj_emb.nelement() > 0:
-                    if obj_emb.ndim == 1: obj_emb = obj_emb.unsqueeze(0)
-                    obj_emb_np = obj_emb.cpu().numpy().astype('float32')
-                    faiss.normalize_L2(obj_emb_np)
-                    obj_emb = torch.tensor(obj_emb_np).to(query_embedding_tensor.device)
-                    sim = util.cos_sim(query_embedding_tensor, obj_emb)[0][0].item()
-                    relevance_score_R_i = (sim + 1) / 2.0
-            source_str = data_item['doc'].metadata.get('source', 'unknown_source')
+            relevance_score_R_i = temp_relevance_scores.get(doc_object_text, 0.0) # Default to 0 if not found
+
+            current_metadata = data_item['metadata'] if isinstance(data_item['metadata'], dict) else {}
+            source_str = current_metadata.get('source', 'unknown_source')
             source_type = 'table' if 'table' in source_str else 'passage'
             parsed_content_val = None
             if source_type == 'table':
                 parsed_content_val = self._parse_table_object_string(doc_object_text)
+            
             mip_input_candidates.append({
-                'id': bm25_doc_id_key,
+                'id': doc_id,
                 'text': doc_object_text,
                 'source_type': source_type,
                 'parsed_content': parsed_content_val,
                 'relevance_score_R_i': relevance_score_R_i,
-                'metadata': data_item['metadata']
+                'metadata': current_metadata
             })
-        start_mip = time.time()
+
+        relevance_scoring_time = time.time() - relevance_scoring_start_time
+        print(f"Relevance scoring (R_i) time: {relevance_scoring_time:.2f}s. MIP candidates: {len(mip_input_candidates)}")
+
+        # MIP Object Selection
+        mip_solve_start_time = time.time()
         selected_objects_by_mip = []
         if mip_input_candidates:
             selected_objects_by_mip = self._solve_mip_object_selection(
                 candidate_objects=mip_input_candidates,
                 k_select=self.mip_k_select
             )
-        end_mip = time.time(); print(f"MIP solver time: {end_mip - start_mip}")
+        mip_solve_time = time.time() - mip_solve_start_time 
+        print(f"MIP selection (_solve_mip_object_selection) total time: {mip_solve_time:.2f}s")
+
+        # LLM selects from MIP chosen objects
+        llm_final_selection_start_time = time.time()
         lm += "\nHere are the objects that can be relevant to answer the user query:\n"
         object_ids_for_llm_selection = []
-        mip_objects_map_for_final_selection = {}
+        mip_objects_map_for_final_selection = {} 
+
         if selected_objects_by_mip:
-            for obj_data_item in selected_objects_by_mip:
-                page_title = obj_data_item['metadata'].get('page_title', 'unknown_page_title')
-                source_info = obj_data_item['metadata'].get('source', 'unknown_source')
-                object_llm_id = f"{page_title}_{source_info}"
+            for idx, obj_data_item in enumerate(selected_objects_by_mip):
+                meta = obj_data_item.get('metadata', {})
+                page_title = meta.get('page_title', f"untitled_{idx}")
+                source_info = meta.get('source', f"unknownsrc_{idx}")
+                object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_") # Clean ID
+
                 object_ids_for_llm_selection.append(object_llm_id)
                 mip_objects_map_for_final_selection[object_llm_id] = obj_data_item
                 lm += f"Id: '{object_llm_id}' {obj_data_item['text']}\n"
         else:
             lm += "No specific objects were selected by the solver as most relevant.\n"
+        
         lm += "\nFrom the above objects, here are the IDs of those that are enough to answer the query:\n"
+        
         if not selected_objects_by_mip:
-            stop_sequence_for_empty = "<>"
-            lm = lm + gen(name='final_eos_for_empty_list', stop=stop_sequence_for_empty, max_tokens=10)
-            lm = lm + stop_sequence_for_empty
-            print(f"Debug: Captured for empty list: '{lm.get('final_eos_for_empty_list', '')}'")
+            lm += gen(name='final_eos_for_empty_list', stop="<>", max_tokens=20) 
         else:
-            stop_sequence_for_ids = "\n<>"
-            lm = lm + gen(name='final_selected_ids_list', stop=stop_sequence_for_ids, max_tokens=512)
-            lm = lm + stop_sequence_for_ids
-            print(f"Debug: Captured ID list: '{lm.get('final_selected_ids_list', '')}'")
-        print(f"Final LLM output : \n{lm}")
+            lm += gen(name='final_selected_ids_list', stop="\n<>", max_tokens=512) 
+        
+        lm += "<>" 
+
         llm_chosen_final_objects = []
         raw_ids_string_from_llm = lm.get('final_selected_ids_list', '').strip()
+        print(f"LLM raw selected ID string: '{raw_ids_string_from_llm}'")
+
         if selected_objects_by_mip and raw_ids_string_from_llm and \
-        raw_ids_string_from_llm.lower() not in ["no objects to select from.", "no specific objects were selected by the solver as most relevant.", "none", "n/a", ""]:
-            selected_ids_list = [id_str.strip() for id_str in raw_ids_string_from_llm.split(',') if id_str.strip()]
-            for llm_id in selected_ids_list:
-                cleaned_llm_id = llm_id.strip("'\"")
-                if cleaned_llm_id in mip_objects_map_for_final_selection:
-                    llm_chosen_final_objects.append(mip_objects_map_for_final_selection[cleaned_llm_id])
+           raw_ids_string_from_llm.lower() not in ["no objects to select from.", 
+                                                   "no specific objects were selected by the solver as most relevant.", 
+                                                   "none", "n/a", ""]:
+            selected_ids_list_from_llm = [id_str.strip().strip("'\"") for id_str in raw_ids_string_from_llm.split(',') if id_str.strip()]
+            print(f"LLM parsed selected IDs: {selected_ids_list_from_llm}")
+            for llm_id in selected_ids_list_from_llm:
+                if llm_id in mip_objects_map_for_final_selection:
+                    llm_chosen_final_objects.append(mip_objects_map_for_final_selection[llm_id])
                 else:
-                    print(f"Warning: LLM selected ID '{cleaned_llm_id}' (original: '{llm_id}') which was not found in the candidate map presented to it.")
-        lm = lm.set('llm_final_selected_objects', llm_chosen_final_objects)
-        end_total = time.time(); print(f"Total retrieval function time: {end_total - start_total}")
+                    print(f"Warning: LLM selected ID '{llm_id}' which was not in the MIP candidate map presented to it.")
+        
+        lm.set('llm_final_selected_objects', llm_chosen_final_objects)
+        llm_final_selection_time = time.time() - llm_final_selection_start_time
+        
+        total_arm_time = time.time() - start_total_time
+        print(f"LLM final selection processing time: {llm_final_selection_time:.2f}s")
+        print(f"Total _perform_arm_retrieval_for_query time: {total_arm_time:.2f}s")
         return lm
 
 if __name__ == "__main__":
