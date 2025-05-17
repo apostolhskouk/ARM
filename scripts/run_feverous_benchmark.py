@@ -15,13 +15,13 @@ import wandb
 import traceback
 from src.retrieval.react import ReActRetriever # Assuming ReActRetriever is in this location
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark.json") # Use Path object
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_1000.json") # Use Path object
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
 
 # Levels to iterate through
-INDEX_LEVELS_TO_RUN = ["table", "row", "cell"]
+INDEX_LEVELS_TO_RUN = ["table", "row"]
 K_RESULTS = 30
 EVALUATION_N_VALUES = [1, 3, 5] # N values for P/R/F1@N
 
@@ -99,9 +99,9 @@ if __name__ == "__main__":
             #"BM25": lambda: PyseriniBM25Retriever(),
             #"Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
             #"Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
             #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            #"ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
+            "ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
         }
 
         for name, init_func in retriever_instances.items():

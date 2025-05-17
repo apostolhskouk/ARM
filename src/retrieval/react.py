@@ -17,6 +17,8 @@ REACT_PROMPT_TEMPLATE = """Solve a question answering task with interleaving Tho
 (1) Search[keyword], which returns relevant documents or tables. Use precise keywords based on your thought process.
 (2) Finish[answer], which returns the final answer and finishes the task.
 
+Important: Your primary goal is to find documents that directly answer the question. Continue using the Search action, possibly multiple times with refined keywords, until you have retrieved observations that contain the necessary information. The final answer provided in the Finish action must be explicitly derived from the content of these observations. Do not stop searching prematurely if the current observations are insufficient, ambiguous, or do not directly lead to the answer. It is acceptable to retrieve some irrelevant documents as long as you eventually find the ones that support the answer. Ensure your reasoning in the Thought step clearly justifies why the retrieved information is sufficient before using Finish.
+
 Here are some examples:
 
 User question: what is the full name of the jesus college alumni who graduated in 1960 ?
@@ -26,47 +28,38 @@ Observation:
 page_title: List_of_politicians,_lawyers,_and_civil_servants_educated_at_Jesus_College,_Oxford
 source: table_0
 object: List_of_politicians,_lawyers,_and_civil_servants_educated_at_Jesus_College,_Oxford [SEP] | Name | M | G | Degree | Notes | [SEP] | Lalith Athulathmudali | 1955 | 1960 | BA Jurisprudence ( 2nd , 1958 ) , BCL ( 2nd , 1960 ) | President of the Oxford Union ( 1958 ) ; a Sri Lankan politician ; killed by the Tamil Tigers in 1993 |
----
 page_title: List_of_politicians,_lawyers,_and_civil_servants_educated_at_Jesus_College,_Oxford
 source: table_0
 object: List_of_politicians,_lawyers,_and_civil_servants_educated_at_Jesus_College,_Oxford [SEP] | Name | M | G | Degree | Notes | [SEP] | Neal Blewett ( HF ) | 1957 | 1959 | BA PPE ( 2nd ) | Member of the Australian House of Representatives ( 1977-1994 ) , Government Minister ( 1983-1994 ) , High Commissioner to the UK ( 1994-1998 ) |
----
 page_title: Jesus_College,_Oxford
 source: sentence_5
 object: Jesus_College,_Oxford [SEP] Jesus College is one of the constituent colleges of the [[University_of_Oxford|University of Oxford]] in [[England|England]].
----
 page_title: Jesus_College,_Oxford
 source: sentence_0
 object: Jesus_College,_Oxford [SEP] It was founded by [[Elizabeth_I|Elizabeth I]] on 27 June 1571.
----
 page_title: List_of_Oxford_University_people
 source: sentence_12
-object: List_of_Oxford_University_people [SEP] Alumni of Jesus College include [[T._E._Lawrence|T. E. Lawrence]] ('Lawrence of Arabia'), [[Harold_Wilson|Harold Wilson]] (twice [[Prime_Minister_of_the_United_Kingdom|Prime Minister of the UK]]), [[Angus_Buchanan_(VC)|Angus Buchanan]] [[VC]], and [[Pixley_ka_Isaka_Seme|Pixley ka Isaka Seme]], founder of the [[African_National_Congress|African National Congress]].
----
-Thought: The first result from the table 'List_of_politicians...' lists Lalith Athulathmudali with a 1960 BCL degree. I need to find his full name. I should search specifically for 'Lalith Athulathmudali'.
+object: List_of_Oxford_University_people [SEP] Alumni of Jesus College include [[T._E.Lawrence|T. E. Lawrence]] ('Lawrence of Arabia'), [[Harold_Wilson|Harold Wilson]] (twice [[Prime_Minister_of_the_United_Kingdom|Prime Minister of the UK]]), [[Angus_Buchanan(VC)|Angus Buchanan]] [[VC]], and [[Pixley_ka_Isaka_Seme|Pixley ka Isaka Seme]], founder of the [[African_National_Congress|African National Congress]].
+Thought: The first result from the table 'List_of_politicians...' lists Lalith Athulathmudali with a 1960 BCL degree. This seems relevant. I need to find his full name. I should search specifically for 'Lalith Athulathmudali' to confirm and get more details.
 Action: Search[Lalith Athulathmudali full name]
 Observation:
 page_title: Lalith_Athulathmudali
 source: sentence_0
 object: Lalith_Athulathmudali [SEP] Lalith William Samarasekera Athulathmudali, [[Queen's_Counsel|PC]] ({{lang-si|ලලිත් විලියම් සමරසේකර අතුලත්මුදලි}}; 26 November 1936 – 23 April 1993), known as Lalith Athulathmudali, was a [[Sri_Lanka|Sri Lankan]] statesman.
----
 page_title: Lalith_Athulathmudali
 source: sentence_1
 object: Lalith_Athulathmudali [SEP] He was a prominent member of the [[United_National_Party|United National Party]], who served as [[Minister_of_Trade_(Sri_Lanka)|Minister of Trade and Shipping]] ; [[Minister_of_National_Security_(Sri_Lanka)|Minister National Security]] and [[Deputy_Minister_of_Defence_(Sri_Lanka)|Deputy Minister of Defence]] ; [[Minister_of_Agriculture_(Sri_Lanka)|Minister of Agriculture]], Food and Cooperatives and finally [[Minister_of_Education_(Sri_Lanka)|Minister of Education]].
----
 page_title: Assassination_of_Lalith_Athulathmudali
 source: sentence_0
 object: Assassination_of_Lalith_Athulathmudali [SEP] The assassination of Lalith Athulathmudali took place on 23 April 1993 in [[Kirulapana]], [[Sri_Lanka|Sri Lanka]].
----
 page_title: Gamini_Dissanayake
 source: sentence_5
 object: Gamini_Dissanayake [SEP] Dissanayake, along with [[Lalith_Athulathmudali|Lalith Athulathmudali]], spearheaded the [[Impeachment_process_against_Ranasinghe_Premadasa|impeachment motion]] against President [[Ranasinghe_Premadasa|Premadasa]] in 1991.
----
 page_title: Sri_Lanka
 source: sentence_20
 object: Sri_Lanka [SEP] Notable political figures include [[Sirimavo_Bandaranaike|Sirimavo Bandaranaike]], the world's first female head of government, and individuals like [[Lalith_Athulathmudali|Lalith Athulathmudali]].
----
-Thought: The first result provides the full name: Lalith William Samarasekera Athulathmudali. This answers the question.
+
+Thought: The first result provides the full name: Lalith William Samarasekera Athulathmudali. This information is directly from the retrieved documents and answers the question.
 Action: Finish[Lalith William Samarasekera Athulathmudali]
 
 User question: the home stadium of the bray wanderers of 2006 league of ireland is situated behind what station?
@@ -76,47 +69,38 @@ Observation:
 page_title: Carlisle_Grounds
 source: sentence_0
 object: Carlisle_Grounds [SEP] Carlisle Grounds is a [[Association_football|football]] stadium in [[Bray,_County_Wicklow|Bray]], [[County_Wicklow|County Wicklow]], [[Ireland|Ireland]].
----
 page_title: Carlisle_Grounds
 source: sentence_1
 object: Carlisle_Grounds [SEP] It is the home ground of [[League_of_Ireland_Premier_Division|League of Ireland]] club [[Bray_Wanderers_A.F.C.|Bray Wanderers A.F.C.]]
----
 page_title: Bray_Daly_railway_station
 source: sentence_0
 object: Bray_Daly_railway_station [SEP] Bray Daly railway station ([[Irish_language|Irish]]: Stáisiún Bhré / Uí Dhálaigh) serves Bray in County Wicklow, Ireland.
----
 page_title: Bray_Daly_railway_station
 source: sentence_2
 object: Bray_Daly_railway_station [SEP] It is located adjacent to the [[Carlisle_Grounds|Carlisle Grounds]] on the Albert Walk.
----
 page_title: Bray_Wanderers_A.F.C.
 source: sentence_21
 object: Bray_Wanderers_A.F.C. [SEP] In the [[2006_League_of_Ireland_Premier_Division|2006 League of Ireland Premier Division]] season, Bray Wanderers finished 10th under manager [[Pat_Devlin|Pat Devlin]], playing their home games at the Carlisle Grounds.
----
-Thought: The results identify the stadium as Carlisle Grounds in Bray. The Bray_Daly_railway_station page explicitly states it is located adjacent to the Carlisle Grounds. Now I need to confirm the 'behind' relationship.
+Thought: The results identify the stadium as Carlisle Grounds in Bray. The Bray_Daly_railway_station page explicitly states it is located adjacent to the Carlisle Grounds. Now I need to confirm the 'behind' relationship, as 'adjacent' is not specific enough. I will search for information about the relative positions.
 Action: Search[Carlisle Grounds Bray Daly station relationship behind adjacent]
 Observation:
 page_title: Bray_Daly_railway_station
 source: sentence_2
 object: Bray_Daly_railway_station [SEP] It is located adjacent to the [[Carlisle_Grounds|Carlisle Grounds]] on the Albert Walk.
----
 page_title: Carlisle_Grounds
 source: sentence_9
 object: Carlisle_Grounds [SEP] Directions to Carlisle Grounds: By DART/Train: Take the DART south bound to Bray (terminus). The Carlisle Grounds are situated immediately beside/behind the station platform exit.
----
 page_title: Bray_Seafront
 source: sentence_3
 object: Bray_Seafront [SEP] Key landmarks include the Bray Head hill, the promenade, Bray Daly Station, and the adjacent Carlisle Grounds.
----
 page_title: Travel_to_Bray_Wanderers
 source: sentence_4
 object: Travel_to_Bray_Wanderers [SEP] For away fans travelling by train, exit Bray Daly station and the Carlisle Grounds entrance is immediately visible as it sits right next to the station.
----
 page_title: Bray_Town_Council_Minutes
 source: sentence_2
 object: Bray_Town_Council_Minutes [SEP] Discussion regarding access improvements near Bray Daly Station noted its direct adjacency to the Carlisle Grounds.
----
-Thought: The observations confirm Bray Daly station is adjacent/beside/next to the Carlisle Grounds. Sentence 9 from Carlisle_Grounds explicitly mentions "beside/behind the station platform exit". This confirms Bray Daly is the station.
+
+Thought: The observations confirm Bray Daly station is adjacent/beside/next to the Carlisle Grounds. Sentence 9 from Carlisle_Grounds explicitly mentions "beside/behind the station platform exit". This retrieved information directly supports that Bray Daly is the station and it's behind (part of beside/behind) the station exit, implying the grounds are behind the station from that perspective.
 Action: Finish[Bray Daly railway station]
 
 --- Start of Current Task ---
@@ -125,44 +109,45 @@ Action: Finish[Bray Daly railway station]
 # --- Guidance Program Definition (Moved Outside Class) ---
 @guidance(stateless=False, dedent=False)
 def react_guidance_program(lm, question: str, max_rounds: int, search_func: Callable[[str], str], initial_prompt: str):
-    """Guidance program implementing the ReAct loop.
-
-    Args:
-        lm: The guidance language model instance.
-        question: The user's question.
-        max_rounds: Maximum number of thought-action-observation cycles.
-        search_func: A callable function that takes search keywords (str)
-                     and returns an observation string (str).
-        initial_prompt: The initial system/few-shot prompt (like REACT_PROMPT_TEMPLATE).
-    """
-    # Use the provided initial prompt which includes few-shot examples
     lm += initial_prompt
     lm += f"\nUser question: {question}"
     with assistant():
         for i in range(1, max_rounds + 1):
-            # Generate Thought
-            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0.2,max_tokens=200)}'
-            # Generate Action Type
+            prompt_for_thought_gen = str(lm) + f"\nThought:"
+            print(f"\n[VERBOSE] Round {i}: Input to Thought Generation:\n{prompt_for_thought_gen}")
+            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0.2,max_tokens=5000)}'
+            generated_thought = lm.get(f"thought_{i}")
+            print(f"[VERBOSE] Round {i}: Output of Thought Generation:\n{generated_thought}")
+            prompt_for_action_type_gen = str(lm) + f"\nAction:"
+            print(f"\n[VERBOSE] Round {i}: Input to Action Type Generation:\n{prompt_for_action_type_gen}")
+            
             lm += f'\nAction: {select(["Search", "Finish"], name=f"act_{i}")}'
-            # Generate Action Argument
-            lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=100, temperature=0.0)}]'
+            prompt_for_action_arg_gen = str(lm) + f"["
+            print(f"\n[VERBOSE] Round {i}: Input to Action Argument Generation:\n{prompt_for_action_arg_gen}")
+            lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=5000, temperature=0.0)}]'
+            generated_action_arg = lm.get(f"arg_{i}")
+            print(f"[VERBOSE] Round {i}: Output of Action Argument Generation:\n{generated_action_arg}")
             current_act = lm.get(f'act_{i}')
             current_arg = lm.get(f'arg_{i}')
-            # Check if the model chose to finish
+
             if current_act == 'Finish':
-                lm += "\n" # Add newline for clean output separation before loop breaks
+                lm += "\n"
                 break
             elif current_act == 'Search' and current_arg is not None and current_arg.strip():
-                # Call the externally provided search function
+                search_query_to_print = current_arg.strip()
+                print(f"ReAct Step {i} - Search Query: {search_query_to_print}")
                 try:
-                    observation = search_func(current_arg.strip())
+                    observation = search_func(search_query_to_print)
                 except Exception as e:
                     observation = "Observation: Error during search execution."
                 lm += f'\nObservation:\n{observation}'
             elif current_act == 'Search':
+                 print(f"ReAct Step {i} - Search Query: [EMPTY/INVALID]")
                  lm += '\nObservation: Failed to generate valid search keywords.'
             else:
-                break # Exit loop
+                action_str = str(current_act) if current_act is not None else "None"
+                arg_str = str(current_arg) if current_arg is not None else "None"
+                lm += f'\nObservation: An unexpected action type "{action_str}" with argument "{arg_str}" was generated. Continuing to next thought.'
 
     final_arg = None
     last_act = None
@@ -182,6 +167,8 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
         lm = lm.set('final_argument', final_arg) 
 
     return lm
+
+    
 
 
 # --- ReAct Retriever Implementation ---

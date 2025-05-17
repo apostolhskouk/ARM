@@ -6,7 +6,7 @@ from tqdm import tqdm
 import logging
 import re
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=print, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def simple_tokenize(text):
     """Simple tokenizer that splits on words/punctuation, removes [SEP], and lowercases."""
@@ -23,7 +23,7 @@ def generate_ngrams(tokens, min_n, max_n):
         for i in range(num_tokens - n + 1):
             yield tuple(tokens[i:i+n]) # Yield tuple for hashability
 
-def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3):
+def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3, field_to_index="object"):
     """
     Builds a MARISA-Trie index from n-grams extracted from a JSON Lines file.
 
@@ -33,8 +33,11 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
         min_n (int): Minimum n-gram size.
         max_n (int): Maximum n-gram size.
     """
-    logging.info(f"Starting Trie index build from '{input_jsonl_path}'")
-    logging.info(f"N-gram range: {min_n} to {max_n}")
+    if os.path.exists(output_trie_path):
+        print(f"Index already exist in '{output_trie_path}'. Skipping indexing.")
+        return
+    print(f"Starting Trie index build from '{input_jsonl_path}'")
+    print(f"N-gram range: {min_n} to {max_n}")
 
     unique_ngram_strings = set()
     processed_lines = 0
@@ -42,14 +45,14 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
     total_lines = 0 # For tqdm progress bar
 
     # --- Phase 1: Collect unique n-gram strings (Reading JSONL) ---
-    logging.info("Phase 1: Reading JSONL and collecting unique n-grams...")
+    print("Phase 1: Reading JSONL and collecting unique n-grams...")
     try:
         # Optional: Count lines first for a better progress bar estimate
-        logging.info("Counting lines in input file...")
+        print("Counting lines in input file...")
         try:
             with open(input_jsonl_path, 'r', encoding='utf-8') as f_count:
                 total_lines = sum(1 for _ in f_count)
-            logging.info(f"Found {total_lines} lines.")
+            print(f"Found {total_lines} lines.")
         except FileNotFoundError:
              logging.error(f"Input file not found during line count: '{input_jsonl_path}'")
              return # Exit if file not found even for counting
@@ -68,7 +71,7 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
                     data = json.loads(line)
 
                     # Extract the 'object' field
-                    serialization_text = data.get("object")
+                    serialization_text = data.get(field_to_index)
 
                     if serialization_text and isinstance(serialization_text, str):
                         tokens = simple_tokenize(serialization_text)
@@ -76,9 +79,6 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
                             for ngram_tuple in generate_ngrams(tokens, min_n, max_n):
                                 ngram_string = " ".join(ngram_tuple)
                                 unique_ngram_strings.add(ngram_string)
-                    # else: # Optionally log records without valid 'object' text
-                    #     logging.debug(f"Skipping line {processed_lines}: No valid 'object' string found or not a string.")
-
                 except json.JSONDecodeError:
                     errors += 1
                     logging.warning(f"Skipping line {processed_lines}: Invalid JSON format.")
@@ -95,7 +95,7 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
         logging.error(f"An unexpected error occurred during file reading: {e}")
         return
 
-    logging.info(f"Finished reading file. Processed {processed_lines} lines.")
+    print(f"Finished reading file. Processed {processed_lines} lines.")
     if errors > 0:
         logging.warning(f"Encountered {errors} errors during JSON parsing or processing.")
 
@@ -105,27 +105,27 @@ def build_marisa_trie_index(input_jsonl_path, output_trie_path, min_n=1, max_n=3
         # Depending on requirements, you might want to return here or still save an empty Trie
         # return
 
-    logging.info(f"Found {num_unique_ngrams} unique n-grams.")
+    print(f"Found {num_unique_ngrams} unique n-grams.")
 
     # --- Phase 2: Build and Save MARISA-Trie ---
-    logging.info("Phase 2: Building MARISA-Trie...")
+    print("Phase 2: Building MARISA-Trie...")
     try:
         # Convert set to list for Trie construction (order doesn't matter for MARISA-Trie)
         ngram_list = list(unique_ngram_strings)
 
         # Build the Trie (uses unicode strings directly)
         trie = marisa_trie.Trie(ngram_list)
-        logging.info("MARISA-Trie built successfully.")
+        print("MARISA-Trie built successfully.")
 
         # Ensure output directory exists
         output_dir = os.path.dirname(output_trie_path)
         if output_dir and not os.path.exists(output_dir):
-            logging.info(f"Creating output directory: '{output_dir}'")
+            print(f"Creating output directory: '{output_dir}'")
             os.makedirs(output_dir)
 
         # Save the Trie
         trie.save(output_trie_path)
-        logging.info(f"Trie saved successfully to '{output_trie_path}'")
+        print(f"Trie saved successfully to '{output_trie_path}'")
 
     except Exception as e:
         logging.error(f"An error occurred during Trie building or saving: {e}")
