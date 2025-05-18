@@ -78,6 +78,8 @@ class ARMRetriever(BaseRetriever):
         self.indexed_field: Optional[str] = None
         self.actual_trie_file_path: Optional[str] = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.ALL_PAIRWISE_COMPATIBILITY_FILENAME = "all_pairwise_compat_scores.pkl"
+        self.all_pairwise_compatibility_scores: Optional[Dict[str, Dict[str, float]]] = None
 
         self.llm_model = models.LlamaCpp(
             self.llm_model_path,
@@ -149,6 +151,11 @@ class ARMRetriever(BaseRetriever):
         self.main_output_folder = output_folder
         self.indexed_field = field_to_index
 
+        if 'id' not in metadata_fields:
+            metadata_fields.append('id')
+        if 'source' not in metadata_fields:
+            metadata_fields.append('source')
+
         self.bm25_retriever.index(input_jsonl_path, self.bm25_index_path, field_to_index, metadata_fields)
         self.faiss_dense_retriever.index(input_jsonl_path, self.faiss_index_path, field_to_index, metadata_fields)
         self._load_faiss_assets(self.faiss_index_path)
@@ -156,15 +163,19 @@ class ARMRetriever(BaseRetriever):
         trie_filename = self._get_trie_filename(field_to_index)
         self.actual_trie_file_path = os.path.join(self.trie_files_directory, trie_filename)
         if not os.path.exists(self.actual_trie_file_path):
-            os.makedirs(self.trie_files_directory, exist_ok=True)
-            build_marisa_trie_index(input_jsonl_path, self.actual_trie_file_path, self.trie_min_n, self.trie_max_n, field_to_index)
+            os.makedirs(self.trie_files_directory, exist_ok=True) 
+            build_marisa_trie_index(input_jsonl_path, self.actual_trie_file_path, self.trie_min_n, self.trie_max_n,field_to_index)
         self._load_trie(self.actual_trie_file_path)
 
         expansion_file_path = os.path.join(output_folder, self.EXPANSION_COMPATIBILITY_FILENAME)
-        if not os.path.exists(expansion_file_path):
+        all_pairwise_compat_file_path = os.path.join(output_folder, self.ALL_PAIRWISE_COMPATIBILITY_FILENAME)
+
+        if not os.path.exists(expansion_file_path) or not os.path.exists(all_pairwise_compat_file_path):
+            print("Building expansion compatibility data and all pairwise compatibility scores...")
+            
             faiss_metadata_pickle_file = os.path.join(self.faiss_index_path, self.FAISS_METADATA_FILENAME)
             if not os.path.exists(faiss_metadata_pickle_file):
-                print(f"FAISS metadata file not found at {faiss_metadata_pickle_file}. Cannot build expansion data.")
+                print(f"FAISS metadata file not found at {faiss_metadata_pickle_file}. Cannot build expansion/compatibility data.")
                 return
 
             with open(faiss_metadata_pickle_file, 'rb') as f:
@@ -173,9 +184,8 @@ class ARMRetriever(BaseRetriever):
             all_objects_data = []
             all_texts_for_embedding_and_tokens = set()
 
-            for idx, meta_item in enumerate(tqdm(faiss_corpus_metadata_list, desc="Parsing all objects for expansion")):
+            for idx, meta_item in enumerate(tqdm(faiss_corpus_metadata_list, desc="Parsing all objects for expansion & compatibility")):
                 text = meta_item['_text']
-                
                 current_metadata = {k: v for k, v in meta_item.items() if k != '_text'}
                 object_unique_id = current_metadata.get('id', f"auto_id_{idx}") 
                 
@@ -216,50 +226,65 @@ class ARMRetriever(BaseRetriever):
             expansion_tokens_cache: Dict[str, Set[str]] = {}
             
             self.expansion_compatibility_data = {}
+            self.all_pairwise_compatibility_scores = {}
 
             for i in tqdm(range(len(all_objects_data)), desc="Calculating pairwise compatibilities"):
                 obj_i = all_objects_data[i]
                 obj_i_id = obj_i['id']
-                compatibilities_for_obj_i = []
+                compatibilities_for_obj_i_expansion = []
+                
+                if obj_i_id not in self.all_pairwise_compatibility_scores:
+                    self.all_pairwise_compatibility_scores[obj_i_id] = {}
 
                 for j in range(len(all_objects_data)):
                     if i == j:
                         continue
                     obj_j = all_objects_data[j]
+                    obj_j_id = obj_j['id']
                     comp_val = 0.0
                     
-                    if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
-                        if obj_i['parsed_content'] and obj_j['parsed_content']:
-                            comp_val = self._calculate_table_table_compatibility_optimized(
-                                obj_i['parsed_content'], obj_j['parsed_content'], 
-                                expansion_text_to_embedding_map, expansion_tokens_cache)
-                    elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
-                        if obj_i['parsed_content']:
-                            passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
-                            comp_val = self._calculate_table_passage_compatibility_optimized(
-                                obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
-                                expansion_text_to_embedding_map, expansion_tokens_cache)
-                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
-                        if obj_j['parsed_content']:
+                    # Check if already computed (due to symmetry j,i)
+                    if obj_j_id in self.all_pairwise_compatibility_scores and \
+                       obj_i_id in self.all_pairwise_compatibility_scores[obj_j_id]:
+                        comp_val = self.all_pairwise_compatibility_scores[obj_j_id][obj_i_id]
+                    else:
+                        if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
+                            if obj_i['parsed_content'] and obj_j['parsed_content']:
+                                comp_val = self._calculate_table_table_compatibility_optimized(
+                                    obj_i['parsed_content'], obj_j['parsed_content'], 
+                                    expansion_text_to_embedding_map, expansion_tokens_cache)
+                        elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
+                            if obj_i['parsed_content']:
+                                passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
+                                comp_val = self._calculate_table_passage_compatibility_optimized(
+                                    obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
+                                    expansion_text_to_embedding_map, expansion_tokens_cache)
+                        elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
+                            if obj_j['parsed_content']:
+                                passage_i_embedding = expansion_text_to_embedding_map.get(obj_i['text'])
+                                comp_val = self._calculate_table_passage_compatibility_optimized(
+                                    obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
+                                    expansion_text_to_embedding_map, expansion_tokens_cache)
+                        elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
                             passage_i_embedding = expansion_text_to_embedding_map.get(obj_i['text'])
-                            comp_val = self._calculate_table_passage_compatibility_optimized(
-                                obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
-                                expansion_text_to_embedding_map, expansion_tokens_cache)
-                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
-                        passage_i_embedding = expansion_text_to_embedding_map.get(obj_i['text'])
-                        passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
-                        comp_val = self._calculate_passage_passage_compatibility_optimized(
-                            obj_i['text'], passage_i_embedding, 
-                            obj_j['text'], passage_j_embedding,
-                            expansion_tokens_cache)
+                            passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
+                            comp_val = self._calculate_passage_passage_compatibility_optimized(
+                                obj_i['text'], passage_i_embedding, 
+                                obj_j['text'], passage_j_embedding,
+                                expansion_tokens_cache)
                     
-                    compatibilities_for_obj_i.append({'candidate_obj_data': obj_j, 'score': comp_val})
+                    self.all_pairwise_compatibility_scores[obj_i_id][obj_j_id] = comp_val
+                    if obj_j_id not in self.all_pairwise_compatibility_scores:
+                        self.all_pairwise_compatibility_scores[obj_j_id] = {}
+                    self.all_pairwise_compatibility_scores[obj_j_id][obj_i_id] = comp_val # Ensure symmetry
 
-                compatibilities_for_obj_i.sort(key=lambda x: x['score'], reverse=True)
+                    compatibilities_for_obj_i_expansion.append({'candidate_obj_data': obj_j, 'score': comp_val})
+
+                compatibilities_for_obj_i_expansion.sort(key=lambda x: x['score'], reverse=True)
                 
                 selected_compatible_objects = []
-                table_candidates = [c for c in compatibilities_for_obj_i if c['candidate_obj_data']['source_type'] == 'table']
-                passage_candidates = [c for c in compatibilities_for_obj_i if c['candidate_obj_data']['source_type'] == 'passage']
+                table_candidates = [c for c in compatibilities_for_obj_i_expansion if c['candidate_obj_data']['source_type'] == 'table']
+                passage_candidates = [c for c in compatibilities_for_obj_i_expansion if c['candidate_obj_data']['source_type'] == 'passage']
 
                 num_tables_to_take = self.expansion_k_compatible // 2
                 num_passages_to_take = self.expansion_k_compatible - num_tables_to_take
@@ -292,14 +317,21 @@ class ARMRetriever(BaseRetriever):
             with open(expansion_file_path, 'wb') as f_out:
                 pickle.dump(self.expansion_compatibility_data, f_out)
             print(f"Expansion compatibility data built and saved to {expansion_file_path}")
+            
+            with open(all_pairwise_compat_file_path, 'wb') as f_out_compat:
+                pickle.dump(self.all_pairwise_compatibility_scores, f_out_compat)
+            print(f"All pairwise compatibility scores built and saved to {all_pairwise_compat_file_path}")
+
         else:
-            print(f"Expansion compatibility data already exists at {expansion_file_path}. Loading...")
+            print(f"Loading pre-built expansion and compatibility data...")
             with open(expansion_file_path, 'rb') as f_in:
                 self.expansion_compatibility_data = pickle.load(f_in)
             print("Expansion compatibility data loaded.")
-
+            with open(all_pairwise_compat_file_path, 'rb') as f_in_compat:
+                self.all_pairwise_compatibility_scores = pickle.load(f_in_compat)
+            print("All pairwise compatibility scores loaded.")
+            
     def _ensure_assets_loaded(self, output_folder_from_retrieve: str):
-        
         if self.main_output_folder != output_folder_from_retrieve and output_folder_from_retrieve is not None:
             self.main_output_folder = output_folder_from_retrieve
             
@@ -313,6 +345,7 @@ class ARMRetriever(BaseRetriever):
             self.faiss_text_to_idx_map = None
             self.trie = None
             self.expansion_compatibility_data = None 
+            self.all_pairwise_compatibility_scores = None # Reset this too
 
         if self.faiss_index is None or self.faiss_text_to_idx_map is None:
             if self.faiss_index_path and os.path.exists(self.faiss_index_path):
@@ -328,6 +361,7 @@ class ARMRetriever(BaseRetriever):
                  self._load_trie(self.trie_index_path)
             else:
                 pass
+        
         if self.expansion_compatibility_data is None and self.main_output_folder:
             expansion_file = os.path.join(self.main_output_folder, self.EXPANSION_COMPATIBILITY_FILENAME)
             if os.path.exists(expansion_file):
@@ -336,8 +370,19 @@ class ARMRetriever(BaseRetriever):
                     self.expansion_compatibility_data = pickle.load(f)
                 print("Expansion compatibility data loaded.")
             else:
-                print(f"Expansion compatibility data file not found at {expansion_file}. Expansion will not be performed if data is missing.")
-
+                print(f"Expansion compatibility data file not found at {expansion_file}.")
+        
+        if self.all_pairwise_compatibility_scores is None and self.main_output_folder:
+            all_compat_file = os.path.join(self.main_output_folder, self.ALL_PAIRWISE_COMPATIBILITY_FILENAME)
+            if os.path.exists(all_compat_file):
+                print(f"Loading all pairwise compatibility scores from {all_compat_file}...")
+                with open(all_compat_file, 'rb') as f_compat:
+                    self.all_pairwise_compatibility_scores = pickle.load(f_compat)
+                print("All pairwise compatibility scores loaded.")
+            else:
+                print(f"All pairwise compatibility scores file not found at {all_compat_file}. Scores will be computed on-the-fly if needed.")
+                
+                
     def retrieve(self,
                  nlqs: List[str],
                  output_folder: str, 
@@ -577,75 +622,80 @@ class ARMRetriever(BaseRetriever):
         R = [obj['relevance_score_R_i'] for obj in candidate_objects]
         C = np.zeros((num_objects, num_objects))
 
-        all_texts_for_embedding = set()
+        # Prepare embeddings and tokens cache for on-the-fly calculations if needed
+        # (e.g., if a pair is not in precomputed scores, or for future flexibility)
+        all_texts_for_embedding_mip = set()
         for obj in candidate_objects:
+            # This is primarily for R_i and fallback C_ij.
+            # R_i is calculated outside and passed in as 'relevance_score_R_i'.
+            # For C_ij, we'll try precomputed first.
             if obj['source_type'] == 'table' and obj['parsed_content']:
                 for header in obj['parsed_content']['columns'].keys():
-                    all_texts_for_embedding.add(header)
+                    all_texts_for_embedding_mip.add(header)
                 for cell_list in obj['parsed_content']['columns'].values():
                     for cell_content in cell_list:
-                        all_texts_for_embedding.add(cell_content)
+                        all_texts_for_embedding_mip.add(cell_content)
             elif obj['source_type'] == 'passage':
-                all_texts_for_embedding.add(obj['text'])
+                all_texts_for_embedding_mip.add(obj['text'])
         
-        unique_texts_list = list(all_texts_for_embedding)
-        text_to_embedding_map: Dict[str, torch.Tensor] = {}
+        unique_texts_list_mip = list(all_texts_for_embedding_mip)
+        text_to_embedding_map_mip: Dict[str, torch.Tensor] = {}
 
-        if unique_texts_list:
+        if unique_texts_list_mip: # Only compute if there are texts that might need it
             batch_size = 32 if self.device.type == 'cpu' else 128 
-            all_embeddings = self.embedding_model.encode(
-                unique_texts_list, 
+            all_embeddings_mip = self.embedding_model.encode(
+                unique_texts_list_mip, 
                 convert_to_tensor=True, 
-                show_progress_bar=False,
+                show_progress_bar=False, # Usually False for internal MIP calls
                 batch_size=batch_size 
             )
-            for text, embedding_tensor in zip(unique_texts_list, all_embeddings):
-                text_to_embedding_map[text] = embedding_tensor
+            for text, embedding_tensor in zip(unique_texts_list_mip, all_embeddings_mip):
+                text_to_embedding_map_mip[text] = embedding_tensor
 
         tokens_cache_for_mip: Dict[str, Set[str]] = {}
 
-        tt_time = tp_time = pp_time = 0.0
         for i in range(num_objects):
             for j in range(i + 1, num_objects):
                 obj_i = candidate_objects[i]; obj_j = candidate_objects[j]
+                obj_i_id = obj_i['id']; obj_j_id = obj_j['id']
                 comp_val = 0.0
-                
-                if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
-                    if obj_i['parsed_content'] and obj_j['parsed_content']:
-                        t0 = time.time()
-                        comp_val = self._calculate_table_table_compatibility_optimized(
-                            obj_i['parsed_content'], obj_j['parsed_content'], 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tt_time += time.time() - t0
-                elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
-                    if obj_i['parsed_content']:
-                        t0 = time.time()
-                        passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
-                        comp_val = self._calculate_table_passage_compatibility_optimized(
-                            obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tp_time += time.time() - t0
-                elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
-                    if obj_j['parsed_content']:
-                        t0 = time.time()
-                        passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
-                        comp_val = self._calculate_table_passage_compatibility_optimized(
-                            obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tp_time += time.time() - t0
-                elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
-                    t0 = time.time()
-                    passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
-                    passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
-                    comp_val = self._calculate_passage_passage_compatibility_optimized(
-                        obj_i['text'], passage_i_embedding, 
-                        obj_j['text'], passage_j_embedding,
-                        tokens_cache_for_mip)
-                    pp_time += time.time() - t0
-                C[i, j] = C[j, i] = comp_val
+                precomputed_found = False
 
-        mip_C_matrix_time = time.time() - mip_setup_start_time
+                if self.all_pairwise_compatibility_scores:
+                    if obj_i_id in self.all_pairwise_compatibility_scores and \
+                       obj_j_id in self.all_pairwise_compatibility_scores[obj_i_id]:
+                        comp_val = self.all_pairwise_compatibility_scores[obj_i_id][obj_j_id]
+                        precomputed_found = True
+                
+                if not precomputed_found:
+                    # Fallback to on-the-fly calculation
+                    if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
+                        if obj_i['parsed_content'] and obj_j['parsed_content']:
+                            comp_val = self._calculate_table_table_compatibility_optimized(
+                                obj_i['parsed_content'], obj_j['parsed_content'], 
+                                text_to_embedding_map_mip, tokens_cache_for_mip)
+                    elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
+                        if obj_i['parsed_content']:
+                            passage_j_embedding = text_to_embedding_map_mip.get(obj_j['text'])
+                            comp_val = self._calculate_table_passage_compatibility_optimized(
+                                obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
+                                text_to_embedding_map_mip, tokens_cache_for_mip)
+                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
+                        if obj_j['parsed_content']:
+                            passage_i_embedding = text_to_embedding_map_mip.get(obj_i['text'])
+                            comp_val = self._calculate_table_passage_compatibility_optimized(
+                                obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
+                                text_to_embedding_map_mip, tokens_cache_for_mip)
+                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
+                        passage_i_embedding = text_to_embedding_map_mip.get(obj_i['text'])
+                        passage_j_embedding = text_to_embedding_map_mip.get(obj_j['text'])
+                        comp_val = self._calculate_passage_passage_compatibility_optimized(
+                            obj_i['text'], passage_i_embedding, 
+                            obj_j['text'], passage_j_embedding,
+                            tokens_cache_for_mip)
+                C[i, j] = C[j, i] = comp_val
         
+        # ... (rest of the MIP solving logic remains the same)
         prob_solve_start_time = time.time()
         prob = LpProblem("ObjectSelectionMIP", LpMaximize)
         b = [LpVariable(f"b_{i}", cat=LpBinary) for i in range(num_objects)]
@@ -678,7 +728,6 @@ class ARMRetriever(BaseRetriever):
             prob += lpSum(b[i] for i in passage_indices) >= min_passages_needed, "MinPassagesConstraint"
 
         solver_used = None
-        # Try Gurobi first
         try :
             prob.solve(GUROBI_CMD(msg=0, timeLimit=30)) 
             if prob.status == 1:
@@ -699,6 +748,7 @@ class ARMRetriever(BaseRetriever):
             selected_objects_indices = [i for i, var_b in enumerate(b) if var_b.value() is not None and var_b.value() > 0.5]
         
         return [candidate_objects[i] for i in selected_objects_indices]
+    
     
     @staticmethod
     def configure_list_size(string_list, n):
