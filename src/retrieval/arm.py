@@ -51,7 +51,9 @@ class ARMRetriever(BaseRetriever):
                 max_keyword_length: int = 20,
                 keyword_alignment :bool = True,
                 generate_n_grams:bool = True,
-                constrained_id_generation:bool = False) -> None:
+                constrained_id_generation:bool = False,
+                expansion_k_compatible: int = 10,
+                expansion_steps: int = 1) -> None:
 
         self.llm_model_path = llm_model_path
         self.faiss_index_path = faiss_index_path
@@ -98,6 +100,10 @@ class ARMRetriever(BaseRetriever):
         self.generate_n_grams = generate_n_grams
         self.constrained_id_generation = constrained_id_generation
         self.current_llm_selected_objects: List[Dict[str, Any]] = [] 
+        self.expansion_k_compatible = expansion_k_compatible
+        self.expansion_steps = expansion_steps
+        self.EXPANSION_COMPATIBILITY_FILENAME = "expansion_compatibility.pkl"
+        self.expansion_compatibility_data: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
     def _load_faiss_assets(self, faiss_folder_path: str) -> bool:
         index_file = os.path.join(faiss_folder_path, self.FAISS_INDEX_FILENAME)
@@ -143,7 +149,6 @@ class ARMRetriever(BaseRetriever):
         self.main_output_folder = output_folder
         self.indexed_field = field_to_index
 
-
         self.bm25_retriever.index(input_jsonl_path, self.bm25_index_path, field_to_index, metadata_fields)
         self.faiss_dense_retriever.index(input_jsonl_path, self.faiss_index_path, field_to_index, metadata_fields)
         self._load_faiss_assets(self.faiss_index_path)
@@ -151,9 +156,147 @@ class ARMRetriever(BaseRetriever):
         trie_filename = self._get_trie_filename(field_to_index)
         self.actual_trie_file_path = os.path.join(self.trie_files_directory, trie_filename)
         if not os.path.exists(self.actual_trie_file_path):
-            os.makedirs(self.trie_files_directory, exist_ok=True) # Ensure directory exists
-            build_marisa_trie_index(input_jsonl_path, self.actual_trie_file_path, self.trie_min_n, self.trie_max_n,field_to_index)
+            os.makedirs(self.trie_files_directory, exist_ok=True)
+            build_marisa_trie_index(input_jsonl_path, self.actual_trie_file_path, self.trie_min_n, self.trie_max_n, field_to_index)
         self._load_trie(self.actual_trie_file_path)
+
+        expansion_file_path = os.path.join(output_folder, self.EXPANSION_COMPATIBILITY_FILENAME)
+        if not os.path.exists(expansion_file_path):
+            faiss_metadata_pickle_file = os.path.join(self.faiss_index_path, self.FAISS_METADATA_FILENAME)
+            if not os.path.exists(faiss_metadata_pickle_file):
+                print(f"FAISS metadata file not found at {faiss_metadata_pickle_file}. Cannot build expansion data.")
+                return
+
+            with open(faiss_metadata_pickle_file, 'rb') as f:
+                faiss_corpus_metadata_list = pickle.load(f)
+
+            all_objects_data = []
+            all_texts_for_embedding_and_tokens = set()
+
+            for idx, meta_item in enumerate(tqdm(faiss_corpus_metadata_list, desc="Parsing all objects for expansion")):
+                text = meta_item['_text']
+                
+                current_metadata = {k: v for k, v in meta_item.items() if k != '_text'}
+                object_unique_id = current_metadata.get('id', f"auto_id_{idx}") 
+                
+                source_type = 'table' if 'table' in current_metadata.get('source', '').lower() else 'passage'
+                parsed_content = self._parse_table_object_string(text) if source_type == 'table' else None
+                
+                all_objects_data.append({
+                    'id': object_unique_id, 
+                    'text': text, 
+                    'source_type': source_type, 
+                    'parsed_content': parsed_content, 
+                    'metadata': current_metadata,
+                    '_original_faiss_idx': idx 
+                })
+                
+                all_texts_for_embedding_and_tokens.add(text)
+                if source_type == 'table' and parsed_content:
+                    for header in parsed_content['columns'].keys():
+                        all_texts_for_embedding_and_tokens.add(header)
+                    for cell_list in parsed_content['columns'].values():
+                        for cell_content in cell_list:
+                            all_texts_for_embedding_and_tokens.add(cell_content)
+            
+            unique_texts_list_for_expansion_embed = list(all_texts_for_embedding_and_tokens)
+            expansion_text_to_embedding_map: Dict[str, torch.Tensor] = {}
+            if unique_texts_list_for_expansion_embed:
+                batch_size = 32 if self.device.type == 'cpu' else 128
+                all_expansion_embeddings = self.embedding_model.encode(
+                    unique_texts_list_for_expansion_embed,
+                    convert_to_tensor=True,
+                    show_progress_bar=True,
+                    batch_size=batch_size,
+                    device=self.device
+                )
+                for text_val, embedding_tensor in zip(unique_texts_list_for_expansion_embed, all_expansion_embeddings):
+                    expansion_text_to_embedding_map[text_val] = embedding_tensor
+
+            expansion_tokens_cache: Dict[str, Set[str]] = {}
+            
+            self.expansion_compatibility_data = {}
+
+            for i in tqdm(range(len(all_objects_data)), desc="Calculating pairwise compatibilities"):
+                obj_i = all_objects_data[i]
+                obj_i_id = obj_i['id']
+                compatibilities_for_obj_i = []
+
+                for j in range(len(all_objects_data)):
+                    if i == j:
+                        continue
+                    obj_j = all_objects_data[j]
+                    comp_val = 0.0
+                    
+                    if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
+                        if obj_i['parsed_content'] and obj_j['parsed_content']:
+                            comp_val = self._calculate_table_table_compatibility_optimized(
+                                obj_i['parsed_content'], obj_j['parsed_content'], 
+                                expansion_text_to_embedding_map, expansion_tokens_cache)
+                    elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
+                        if obj_i['parsed_content']:
+                            passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
+                            comp_val = self._calculate_table_passage_compatibility_optimized(
+                                obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
+                                expansion_text_to_embedding_map, expansion_tokens_cache)
+                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
+                        if obj_j['parsed_content']:
+                            passage_i_embedding = expansion_text_to_embedding_map.get(obj_i['text'])
+                            comp_val = self._calculate_table_passage_compatibility_optimized(
+                                obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
+                                expansion_text_to_embedding_map, expansion_tokens_cache)
+                    elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
+                        passage_i_embedding = expansion_text_to_embedding_map.get(obj_i['text'])
+                        passage_j_embedding = expansion_text_to_embedding_map.get(obj_j['text'])
+                        comp_val = self._calculate_passage_passage_compatibility_optimized(
+                            obj_i['text'], passage_i_embedding, 
+                            obj_j['text'], passage_j_embedding,
+                            expansion_tokens_cache)
+                    
+                    compatibilities_for_obj_i.append({'candidate_obj_data': obj_j, 'score': comp_val})
+
+                compatibilities_for_obj_i.sort(key=lambda x: x['score'], reverse=True)
+                
+                selected_compatible_objects = []
+                table_candidates = [c for c in compatibilities_for_obj_i if c['candidate_obj_data']['source_type'] == 'table']
+                passage_candidates = [c for c in compatibilities_for_obj_i if c['candidate_obj_data']['source_type'] == 'passage']
+
+                num_tables_to_take = self.expansion_k_compatible // 2
+                num_passages_to_take = self.expansion_k_compatible - num_tables_to_take
+
+                taken_tables = table_candidates[:num_tables_to_take]
+                taken_passages = passage_candidates[:num_passages_to_take]
+                selected_compatible_objects.extend(taken_tables)
+                selected_compatible_objects.extend(taken_passages)
+                
+                remaining_needed = self.expansion_k_compatible - len(selected_compatible_objects)
+                if remaining_needed > 0:
+                    if len(table_candidates) > len(taken_tables):
+                        selected_compatible_objects.extend(table_candidates[len(taken_tables) : len(taken_tables) + remaining_needed])
+                    
+                    remaining_needed = self.expansion_k_compatible - len(selected_compatible_objects)
+                    if remaining_needed > 0 and len(passage_candidates) > len(taken_passages):
+                         selected_compatible_objects.extend(passage_candidates[len(taken_passages) : len(taken_passages) + remaining_needed])
+                
+                self.expansion_compatibility_data[obj_i_id] = []
+                for sel_comp in selected_compatible_objects[:self.expansion_k_compatible]:
+                    stored_obj_data = {
+                        'id': sel_comp['candidate_obj_data']['id'],
+                        'text': sel_comp['candidate_obj_data']['text'],
+                        'source_type': sel_comp['candidate_obj_data']['source_type'],
+                        'parsed_content': sel_comp['candidate_obj_data']['parsed_content'],
+                        'metadata': sel_comp['candidate_obj_data']['metadata']
+                    }
+                    self.expansion_compatibility_data[obj_i_id].append(stored_obj_data)
+            
+            with open(expansion_file_path, 'wb') as f_out:
+                pickle.dump(self.expansion_compatibility_data, f_out)
+            print(f"Expansion compatibility data built and saved to {expansion_file_path}")
+        else:
+            print(f"Expansion compatibility data already exists at {expansion_file_path}. Loading...")
+            with open(expansion_file_path, 'rb') as f_in:
+                self.expansion_compatibility_data = pickle.load(f_in)
+            print("Expansion compatibility data loaded.")
 
     def _ensure_assets_loaded(self, output_folder_from_retrieve: str):
         
@@ -169,6 +312,7 @@ class ARMRetriever(BaseRetriever):
             self.faiss_index = None 
             self.faiss_text_to_idx_map = None
             self.trie = None
+            self.expansion_compatibility_data = None 
 
         if self.faiss_index is None or self.faiss_text_to_idx_map is None:
             if self.faiss_index_path and os.path.exists(self.faiss_index_path):
@@ -177,11 +321,22 @@ class ARMRetriever(BaseRetriever):
                 pass
 
         if self.trie is None:
-            if self.trie_index_path and os.path.exists(self.trie_index_path):
-                self._load_trie(self.trie_index_path)
+            if self.actual_trie_file_path and os.path.exists(self.actual_trie_file_path):
+                self._load_trie(self.actual_trie_file_path)
+            elif self.trie_index_path and os.path.exists(self.trie_index_path) and not self.actual_trie_file_path:
+                 print(f"Warning: actual_trie_file_path not set, attempting to load from trie_index_path: {self.trie_index_path}")
+                 self._load_trie(self.trie_index_path)
             else:
                 pass
-
+        if self.expansion_compatibility_data is None and self.main_output_folder:
+            expansion_file = os.path.join(self.main_output_folder, self.EXPANSION_COMPATIBILITY_FILENAME)
+            if os.path.exists(expansion_file):
+                print(f"Loading expansion compatibility data from {expansion_file}...")
+                with open(expansion_file, 'rb') as f:
+                    self.expansion_compatibility_data = pickle.load(f)
+                print("Expansion compatibility data loaded.")
+            else:
+                print(f"Expansion compatibility data file not found at {expansion_file}. Expansion will not be performed if data is missing.")
 
     def retrieve(self,
                  nlqs: List[str],
@@ -635,15 +790,11 @@ class ARMRetriever(BaseRetriever):
         start_total_time = time.time()
         lm += self._get_initial_prompt_string(user_query)
         
-        # Keyword Generation (LLM)
         kw_gen_start_time = time.time()
         lm += gen(name='keywords_str', stop='\n', max_tokens=150)
         keywords_str = lm['keywords_str'].strip()
         keywords = [k.strip() for k in keywords_str.split('|') if k.strip()][:self.max_keywords_per_query]
-        kw_gen_time = time.time() - kw_gen_start_time
 
-        # N-gram Generation (LLM with Trie-constrained selection)
-        ngram_gen_start_time = time.time()
         lm += "\nThe relevant n-grams are:"
         all_parsed_ngrams_for_bm25_queries = []
         if self.generate_n_grams:
@@ -704,16 +855,19 @@ class ARMRetriever(BaseRetriever):
                     if ngrams_for_this_keyword_list:
                         all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
                     
-                    if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 :
-                        lm += ")" 
-            else:
+                    if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 : # This was missing a check for last keyword
+                         lm += ")"
+                    elif keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 and lm.current_text[-1] != ')': # Ensure ')' if loop broke early
+                         lm += ")"
+
+            else: 
                 for keyword_idx, keyword in enumerate(keywords):
                     if keyword_idx > 0: lm += " |"
                     lm += f" {keyword} ("
                     
                     max_gen_tokens = (self.max_rephrases * self.max_keyword_length * 2) + self.max_rephrases
-                    if max_gen_tokens <= 0: # Ensure max_gen_tokens is at least a small positive number
-                        max_gen_tokens = 50 # Default fallback if parameters lead to zero or negative
+                    if max_gen_tokens <= 0: 
+                        max_gen_tokens = 50 
                     unconstrained_ngrams_var = f"unconstrained_ngrams_{keyword_idx}"
                     lm += gen(
                         name=unconstrained_ngrams_var, 
@@ -732,18 +886,17 @@ class ARMRetriever(BaseRetriever):
                     if ngrams_for_this_keyword_list:
                         all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
                     lm += ")"
-        else:
-            lm += "\nThe relevant n-grams are:" # Maintain prompt structure for LLM
+        else: # not self.generate_n_grams
             if keywords:
                 for keyword_idx, keyword_text in enumerate(keywords):
                     if keyword_idx > 0:
                         lm += " |"
-                    lm += f" {keyword_text} ({keyword_text})" # Show keyword as its own "n-gram" in lm
+                    lm += f" {keyword_text} ({keyword_text})" 
             else:
-                lm += " No keywords available to use as n-grams." # Or simply an empty line if no keywords
+                lm += " No keywords available to use as n-grams."
             
             all_parsed_ngrams_for_bm25_queries = [kw for kw in keywords if kw.strip()]
-            
+        
         retrieval_start_time = time.time()
         retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
         if all_parsed_ngrams_for_bm25_queries and self.bm25_index_path and os.path.exists(self.bm25_index_path):
@@ -769,13 +922,14 @@ class ARMRetriever(BaseRetriever):
         faiss_results_for_query: List[RetrievalResult] = retrieved_docs_by_faiss[0] if retrieved_docs_by_faiss else []
         
         combined_initial_candidates = all_bm25_results_flat + faiss_results_for_query
-        retrieval_time = time.time() - retrieval_start_time
+        
         unique_retrieved_objects_map = {}
         for res_item in combined_initial_candidates:
-            doc_id = res_item.metadata.get('id', res_item.object) if isinstance(res_item.metadata, dict) else res_item.object
+            current_meta = res_item.metadata if isinstance(res_item.metadata, dict) else {}
+            doc_id = current_meta.get('id', res_item.object) # Prefer 'id' from metadata
             
             if doc_id not in unique_retrieved_objects_map:
-                unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_score': res_item.score, 'metadata': res_item.metadata}
+                unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_score': res_item.score, 'metadata': current_meta}
             else: 
                 unique_retrieved_objects_map[doc_id]['max_score'] = max(
                     unique_retrieved_objects_map[doc_id]['max_score'], res_item.score
@@ -784,93 +938,86 @@ class ARMRetriever(BaseRetriever):
         if not unique_retrieved_objects_map:
             lm += "\nHere are the objects that can be relevant to answer the user query:\nNo relevant objects found.\n"
             lm += "From the above objects, here are the IDs of those that are enough to answer the query:\nNo objects to select from.\n<>"
-            lm.set('llm_final_selected_objects', [])
+            self.current_llm_selected_objects = []
             return lm
 
-        relevance_scoring_start_time = time.time()
         query_embedding_tensor = self.embedding_model.encode(user_query, convert_to_tensor=True, show_progress_bar=False)
         query_embedding_tensor = query_embedding_tensor.to(self.device)
         if query_embedding_tensor.ndim == 1: query_embedding_tensor = query_embedding_tensor.unsqueeze(0)
         
-        # Normalize query embedding if SBERT model doesn't do it by default and FAISS index is L2 normalized
-        # query_np_for_norm = query_embedding_tensor.cpu().numpy()
-        # if query_np_for_norm.size > 0: faiss.normalize_L2(query_np_for_norm)
-        # query_embedding_tensor = torch.tensor(query_np_for_norm).to(self.device)
+        texts_for_global_Ri_calc = set()
+        for data_item in unique_retrieved_objects_map.values():
+            texts_for_global_Ri_calc.add(data_item['doc'].object)
 
-
-        mip_input_candidates = []
-        temp_relevance_scores: Dict[str, float] = {} # To store R_i for each unique object text
-
-        # Strategy for R_i:
-        # 1. Try to get similarity from FAISS index directly if object text is in faiss_text_to_idx_map
-        # 2. For remaining objects, batch encode their texts and calculate similarity.
-
-        texts_needing_fresh_encoding_for_Ri = []
-        map_text_to_data_item_for_Ri = {} # To link back after batch encoding
+        if self.expansion_compatibility_data and self.expansion_steps > 0:
+            potential_expansion_obj_ids_processed = set()
+            for data_item in unique_retrieved_objects_map.values():
+                base_obj_id = data_item['metadata'].get('id', data_item['doc'].object)
+                if base_obj_id in self.expansion_compatibility_data:
+                    for comp_obj_info in self.expansion_compatibility_data[base_obj_id]:
+                        if comp_obj_info['id'] not in potential_expansion_obj_ids_processed:
+                            texts_for_global_Ri_calc.add(comp_obj_info['text'])
+                            potential_expansion_obj_ids_processed.add(comp_obj_info['id'])
+        
+        unique_texts_list_for_global_Ri = list(texts_for_global_Ri_calc)
+        global_relevance_scores_map: Dict[str, float] = {}
+        
+        texts_needing_fresh_encoding_for_global_Ri = []
 
         if self.faiss_index and self.faiss_text_to_idx_map and self.faiss_index.ntotal > 0:
-            candidate_faiss_indices = []
-            map_faiss_idx_to_text = {}
+            candidate_faiss_indices_global = []
+            map_faiss_idx_to_text_global = {}
 
-            for doc_id, data_item in unique_retrieved_objects_map.items():
-                obj_text = data_item['doc'].object
-                if obj_text in self.faiss_text_to_idx_map:
-                    original_faiss_idx = self.faiss_text_to_idx_map[obj_text]
+            for text_content in unique_texts_list_for_global_Ri:
+                if text_content in self.faiss_text_to_idx_map:
+                    original_faiss_idx = self.faiss_text_to_idx_map[text_content]
                     if 0 <= original_faiss_idx < self.faiss_index.ntotal:
-                        candidate_faiss_indices.append(original_faiss_idx)
-                        map_faiss_idx_to_text[original_faiss_idx] = obj_text
-                    else: # Index out of bounds, or text not actually in current FAISS index
-                        texts_needing_fresh_encoding_for_Ri.append(obj_text)
-                        map_text_to_data_item_for_Ri[obj_text] = data_item
-                else: # Text not in FAISS metadata map
-                    texts_needing_fresh_encoding_for_Ri.append(obj_text)
-                    map_text_to_data_item_for_Ri[obj_text] = data_item
+                        candidate_faiss_indices_global.append(original_faiss_idx)
+                        map_faiss_idx_to_text_global[original_faiss_idx] = text_content
+                    else:
+                        texts_needing_fresh_encoding_for_global_Ri.append(text_content)
+                else:
+                    texts_needing_fresh_encoding_for_global_Ri.append(text_content)
             
-            if candidate_faiss_indices:
-                reconstructed_embs_np = np.array([self.faiss_index.reconstruct(idx) for idx in candidate_faiss_indices]).astype('float32')
-                # if reconstructed_embs_np.size > 0: faiss.normalize_L2(reconstructed_embs_np) # Normalize if needed
-                
-                reconstructed_embs_tensor = torch.tensor(reconstructed_embs_np).to(self.device)
-                if query_embedding_tensor.nelement() > 0 and reconstructed_embs_tensor.nelement() > 0:
-                    sim_scores_tensor = util.cos_sim(query_embedding_tensor, reconstructed_embs_tensor)[0]
-                    for i, original_faiss_idx in enumerate(candidate_faiss_indices):
-                        obj_text = map_faiss_idx_to_text[original_faiss_idx]
-                        score = (sim_scores_tensor[i].item() + 1) / 2.0 # Normalize to 0-1
-                        temp_relevance_scores[obj_text] = score
-        else: # No FAISS index or map, all need fresh encoding
-            for doc_id, data_item in unique_retrieved_objects_map.items():
-                obj_text = data_item['doc'].object
-                texts_needing_fresh_encoding_for_Ri.append(obj_text)
-                map_text_to_data_item_for_Ri[obj_text] = data_item
+            if candidate_faiss_indices_global:
+                reconstructed_embs_np_global = np.array([self.faiss_index.reconstruct(idx) for idx in candidate_faiss_indices_global]).astype('float32')
+                reconstructed_embs_tensor_global = torch.tensor(reconstructed_embs_np_global).to(self.device)
+                if query_embedding_tensor.nelement() > 0 and reconstructed_embs_tensor_global.nelement() > 0:
+                    sim_scores_tensor_global = util.cos_sim(query_embedding_tensor, reconstructed_embs_tensor_global)[0]
+                    for i, original_faiss_idx in enumerate(candidate_faiss_indices_global):
+                        obj_text = map_faiss_idx_to_text_global[original_faiss_idx]
+                        score = (sim_scores_tensor_global[i].item() + 1) / 2.0 
+                        global_relevance_scores_map[obj_text] = score
+        else:
+            texts_needing_fresh_encoding_for_global_Ri.extend(unique_texts_list_for_global_Ri)
         
-        # Batch encode remaining texts for R_i
-        unique_texts_needing_Ri = list(set(texts_needing_fresh_encoding_for_Ri)) # Deduplicate
-        if unique_texts_needing_Ri:
-            obj_embeddings_tensor = self.embedding_model.encode(
-                unique_texts_needing_Ri, convert_to_tensor=True, show_progress_bar=True, batch_size=128
+        unique_texts_needing_fresh_Ri = list(set(texts_needing_fresh_encoding_for_global_Ri))
+        if unique_texts_needing_fresh_Ri:
+            obj_embeddings_tensor_global = self.embedding_model.encode(
+                unique_texts_needing_fresh_Ri, convert_to_tensor=True, show_progress_bar=False, batch_size=128
             )
-            obj_embeddings_tensor = obj_embeddings_tensor.to(self.device)
+            obj_embeddings_tensor_global = obj_embeddings_tensor_global.to(self.device)
 
-            if query_embedding_tensor.nelement() > 0 and obj_embeddings_tensor.nelement() > 0:
-                sim_scores_tensor = util.cos_sim(query_embedding_tensor, obj_embeddings_tensor)[0]
-                for i, text_content in enumerate(unique_texts_needing_Ri):
-                    score = (sim_scores_tensor[i].item() + 1) / 2.0
-                    temp_relevance_scores[text_content] = score
+            if query_embedding_tensor.nelement() > 0 and obj_embeddings_tensor_global.nelement() > 0:
+                sim_scores_tensor_global_fresh = util.cos_sim(query_embedding_tensor, obj_embeddings_tensor_global)[0]
+                for i, text_content in enumerate(unique_texts_needing_fresh_Ri):
+                    score = (sim_scores_tensor_global_fresh[i].item() + 1) / 2.0
+                    global_relevance_scores_map[text_content] = score
         
-        # Construct MIP input candidates using the calculated R_i scores
+        initial_mip_input_candidates = []
         for doc_id, data_item in unique_retrieved_objects_map.items():
             doc_object_text = data_item['doc'].object
-            relevance_score_R_i = temp_relevance_scores.get(doc_object_text, 0.0) # Default to 0 if not found
+            relevance_score_R_i = global_relevance_scores_map.get(doc_object_text, 0.0) 
 
-            current_metadata = data_item['metadata'] if isinstance(data_item['metadata'], dict) else {}
+            current_metadata = data_item['metadata']
             source_str = current_metadata.get('source', 'unknown_source')
-            source_type = 'table' if 'table' in source_str else 'passage'
+            source_type = 'table' if 'table' in source_str.lower() else 'passage'
             parsed_content_val = None
             if source_type == 'table':
                 parsed_content_val = self._parse_table_object_string(doc_object_text)
             
-            mip_input_candidates.append({
-                'id': doc_id,
+            initial_mip_input_candidates.append({
+                'id': doc_id, # This is the crucial ID
                 'text': doc_object_text,
                 'source_type': source_type,
                 'parsed_content': parsed_content_val,
@@ -878,13 +1025,36 @@ class ARMRetriever(BaseRetriever):
                 'metadata': current_metadata
             })
 
+        # Expansion Step
+        expanded_candidates_dict = {obj['id']: obj for obj in initial_mip_input_candidates}
+        if self.expansion_compatibility_data and self.expansion_steps > 0:
+            current_candidates_to_expand_from = list(initial_mip_input_candidates)
+            for step in range(self.expansion_steps):
+                newly_added_in_this_step_list = []
+                for base_obj in current_candidates_to_expand_from:
+                    base_obj_id = base_obj['id']
+                    if base_obj_id in self.expansion_compatibility_data:
+                        for comp_obj_info_template in self.expansion_compatibility_data[base_obj_id]:
+                            comp_obj_id = comp_obj_info_template['id']
+                            if comp_obj_id not in expanded_candidates_dict:
+                                new_candidate = comp_obj_info_template.copy() 
+                                new_candidate['relevance_score_R_i'] = global_relevance_scores_map.get(new_candidate['text'], 0.0)
+                                expanded_candidates_dict[comp_obj_id] = new_candidate
+                                newly_added_in_this_step_list.append(new_candidate)
+                
+                if not newly_added_in_this_step_list:
+                    break 
+                current_candidates_to_expand_from = newly_added_in_this_step_list
+        
+        final_mip_candidates = list(expanded_candidates_dict.values())
+        
         selected_objects_by_mip = []
-        if mip_input_candidates:
+        if final_mip_candidates:
             selected_objects_by_mip = self._solve_mip_object_selection(
-                candidate_objects=mip_input_candidates,
+                candidate_objects=final_mip_candidates,
                 k_select=self.mip_k_select
             )
-        llm_final_selection_start_time = time.time()
+        
         lm += "\nHere are the objects that can be relevant to answer the user query:\n"
         object_ids_for_llm_selection = []
         mip_objects_map_for_final_selection = {} 
@@ -892,9 +1062,9 @@ class ARMRetriever(BaseRetriever):
         if selected_objects_by_mip:
             for idx, obj_data_item in enumerate(selected_objects_by_mip):
                 meta = obj_data_item.get('metadata', {})
-                page_title = meta.get('page_title', f"untitled_{idx}")
-                source_info = meta.get('source', f"unknownsrc_{idx}")
-                object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_")
+                page_title = meta.get('page_title', f"untitled_{obj_data_item['id']}") # Use obj_data_item['id'] for more uniqueness
+                source_info = meta.get('source', f"unknownsrc_{obj_data_item['id']}")
+                object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_").replace("/", "_") # Sanitize more
 
                 object_ids_for_llm_selection.append(object_llm_id)
                 mip_objects_map_for_final_selection[object_llm_id] = obj_data_item
@@ -906,15 +1076,17 @@ class ARMRetriever(BaseRetriever):
         
         raw_ids_string_from_llm = ""
         
-        if self.constrained_id_generation:
+        if self.constrained_id_generation and object_ids_for_llm_selection: # Add check for non-empty list
             all_possible_id_combinations_strs = []
             for i in range(1, len(object_ids_for_llm_selection) + 1):
                 for subset_tuple in combinations(object_ids_for_llm_selection, i):
                     all_possible_id_combinations_strs.append(",".join(subset_tuple))
-            lm += select(options=all_possible_id_combinations_strs, name='final_selected_ids_list')
+            if all_possible_id_combinations_strs: # Ensure options are not empty
+                 lm += select(options=all_possible_id_combinations_strs, name='final_selected_ids_list')
+            else: # Fallback if no combinations (e.g. object_ids_for_llm_selection was empty or had one item and combinations logic failed)
+                 lm += gen(name='final_selected_ids_list', stop="\n<>", max_tokens=1024)
         else:
             lm += gen(name='final_selected_ids_list', stop="\n<>", max_tokens=1024) 
-            
             
         raw_ids_string_from_llm = lm['final_selected_ids_list']
         lm += "<>" 
@@ -930,7 +1102,7 @@ class ARMRetriever(BaseRetriever):
         
         total_arm_time = time.time() - start_total_time
         print(f"Total _perform_arm_retrieval_for_query time: {total_arm_time:.2f}s")
-        print(f"FInal llm output : {lm}")
+        print(f"Final llm output : {lm}")
         return lm
 
 if __name__ == "__main__":
