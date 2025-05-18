@@ -112,32 +112,29 @@ def main():
                         print(f"  Warning: Mismatch in columns for table_id='{original_table_id}', db_id='{db_id}'. Headers: {len(headers)}, Row: {len(row_values)}. Skipping row.")
                         continue
 
-                    serialized_parts = []
+                    object_parts = []
                     for j in range(len(headers)):
-                        serialized_parts.append(f"{str(headers[j])}: {str(row_values[j])}")
+                        object_parts.append(f"[H] {str(headers[j])}: {str(row_values[j])}")
                     
-                    current_row_col_value_pairs = ", ".join(serialized_parts)
+                    col_val_string = " , ".join(object_parts)
 
+                    object_field_value = ""
                     if table_display_name:
-                        final_serialized_row_string = f"Table: {table_display_name}, {current_row_col_value_pairs}"
+                        object_field_value = f"{table_display_name} [SEP] {col_val_string}"
                     else:
-                        final_serialized_row_string = current_row_col_value_pairs
+                        object_field_value = col_val_string
                     
                     record = {
-                        "database_id": str(db_id),
-                        "table_id": str(original_table_id), 
-                        "serialized_row": final_serialized_row_string,
+                        "page_title": str(db_id),
+                        "source": f"table_{str(original_table_id)}",
+                        "object": object_field_value,
                     }
-                    
-                    # Optionally, if you want to keep a separate metadata field for the derived table name
-                    if table_display_name:
-                        record["table_name_from_context"] = table_display_name
-
                     all_serialized_records_for_dataset.append(record)
         
-        output_file_path = output_dir / f"{dataset_name_key}_serialized.json"
+        output_file_path = output_dir / f"{dataset_name_key}_serialized.jsonl"
         with open(output_file_path, "w") as f_out:
-            json.dump(all_serialized_records_for_dataset, f_out, indent=2)
+            for record in all_serialized_records_for_dataset:
+                f_out.write(json.dumps(record) + "\n")
         
         print(f"Finished processing {dataset_name_key}. Output saved to {output_file_path}")
         print("-" * 30)

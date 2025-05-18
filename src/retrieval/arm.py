@@ -10,7 +10,8 @@ import marisa_trie
 import guidance
 from guidance import models, gen, select
 from sentence_transformers import SentenceTransformer, util
-from pulp import LpProblem, LpVariable, lpSum, LpMaximize, LpBinary, PULP_CBC_CMD
+from pulp import LpProblem, LpVariable, lpSum, LpMaximize, LpBinary, HiGHS_CMD, PULP_CBC_CMD, GUROBI_CMD
+from pulp.apis.core import PulpSolverError
 import re
 import textwrap
 import time
@@ -18,7 +19,7 @@ from src.retrieval.base import BaseRetriever, RetrievalResult
 from src.retrieval.bm25 import PyseriniBM25Retriever
 from src.retrieval.dense import FaissDenseRetriever
 from src.utils.trie_index import build_marisa_trie_index, simple_tokenize,find_next_word_continuations
-
+from itertools import combinations
 
 class ARMRetriever(BaseRetriever):
     FAISS_INDEX_FILENAME = "index.faiss"
@@ -47,7 +48,10 @@ class ARMRetriever(BaseRetriever):
                 faiss_retriever_instance: Optional[FaissDenseRetriever] = None,
                 verbose_llm: bool = False,
                 max_rephrases: int = 5,
-                max_keyword_length: int = 20) -> None:
+                max_keyword_length: int = 20,
+                keyword_alignment :bool = True,
+                generate_n_grams:bool = True,
+                constrained_id_generation:bool = False) -> None:
 
         self.llm_model_path = llm_model_path
         self.faiss_index_path = faiss_index_path
@@ -90,6 +94,10 @@ class ARMRetriever(BaseRetriever):
         self.trie: Optional[marisa_trie.Trie] = None
         self.max_rephrases = max_rephrases
         self.max_keyword_length = max_keyword_length
+        self.keyword_alignment = keyword_alignment
+        self.generate_n_grams = generate_n_grams
+        self.constrained_id_generation = constrained_id_generation
+        self.current_llm_selected_objects: List[Dict[str, Any]] = [] 
 
     def _load_faiss_assets(self, faiss_folder_path: str) -> bool:
         index_file = os.path.join(faiss_folder_path, self.FAISS_INDEX_FILENAME)
@@ -186,7 +194,7 @@ class ARMRetriever(BaseRetriever):
         for nlq in tqdm(nlqs, desc="Processing queries", unit="query"):
             executed_program = self.llm_model + self._perform_arm_retrieval_for_query(nlq)
             
-            final_chosen_objects = executed_program.get('llm_final_selected_objects', [])
+            final_chosen_objects = self.current_llm_selected_objects
             
             query_results: List[RetrievalResult] = []
             
@@ -429,16 +437,15 @@ class ARMRetriever(BaseRetriever):
         text_to_embedding_map: Dict[str, torch.Tensor] = {}
 
         if unique_texts_list:
-            # Determine batch size dynamically or make it configurable
             batch_size = 32 if self.device.type == 'cpu' else 128 
             all_embeddings = self.embedding_model.encode(
                 unique_texts_list, 
                 convert_to_tensor=True, 
-                show_progress_bar=False, # Can be set to False for less verbose output
+                show_progress_bar=False,
                 batch_size=batch_size 
             )
             for text, embedding_tensor in zip(unique_texts_list, all_embeddings):
-                text_to_embedding_map[text] = embedding_tensor # Already on self.device from encode
+                text_to_embedding_map[text] = embedding_tensor
 
         tokens_cache_for_mip: Dict[str, Set[str]] = {}
 
@@ -483,10 +490,6 @@ class ARMRetriever(BaseRetriever):
                 C[i, j] = C[j, i] = comp_val
 
         mip_C_matrix_time = time.time() - mip_setup_start_time
-        print(f"Time taken for MIP C matrix setup: {mip_C_matrix_time:.2f} seconds")
-        print(f"  Table-Table compatibility calculation time: {tt_time:.2f} seconds")
-        print(f"  Table-Passage compatibility calculation time: {tp_time:.2f} seconds")
-        print(f"  Passage-Passage compatibility calculation time: {pp_time:.2f} seconds")
         
         prob_solve_start_time = time.time()
         prob = LpProblem("ObjectSelectionMIP", LpMaximize)
@@ -494,7 +497,7 @@ class ARMRetriever(BaseRetriever):
         c_vars = {}
         for i in range(num_objects):
             for j in range(i + 1, num_objects):
-                if C[i][j] > 1e-6: # Only create var if C[i][j] is meaningfully positive
+                if C[i][j] > 1e-6: 
                      c_vars[(i,j)] = LpVariable(f"c_{i}_{j}", cat=LpBinary)
 
         objective = lpSum(R[i] * b[i] for i in range(num_objects))
@@ -519,16 +522,29 @@ class ARMRetriever(BaseRetriever):
         if passage_indices and min_passages_needed > 0:
             prob += lpSum(b[i] for i in passage_indices) >= min_passages_needed, "MinPassagesConstraint"
 
-        prob.solve(PULP_CBC_CMD(msg=0, timeLimit=30))
-        prob_solve_time = time.time() - prob_solve_start_time
+        solver_used = None
+        # Try Gurobi first
+        try :
+            prob.solve(GUROBI_CMD(msg=0, timeLimit=30)) 
+            if prob.status == 1:
+                solver_used = "Gurobi"
+            else:
+                print(f"Gurobi solver ran but did not find an optimal solution (status: {prob.status}).")
+        except PulpSolverError as e:
+            pass
+        if solver_used is None and prob.status != 1:
+            prob.solve(PULP_CBC_CMD(msg=0, timeLimit=30))
+            if prob.status == 1:
+                solver_used = "CBC"
+            else:
+                print(f"CBC solver ran but did not find an optimal solution (status: {prob.status}).")
         
         selected_objects_indices = []
         if prob.status == 1: 
             selected_objects_indices = [i for i, var_b in enumerate(b) if var_b.value() is not None and var_b.value() > 0.5]
         
         return [candidate_objects[i] for i in selected_objects_indices]
-
-
+    
     @staticmethod
     def configure_list_size(string_list, n):
         if not string_list:
@@ -612,6 +628,7 @@ class ARMRetriever(BaseRetriever):
 
         User question: {user_query}
         The relevant keywords are: """)
+     
     
     @guidance(stateless=False)
     def _perform_arm_retrieval_for_query(self, lm, user_query: str): # lm is the guidance model state
@@ -629,69 +646,104 @@ class ARMRetriever(BaseRetriever):
         ngram_gen_start_time = time.time()
         lm += "\nThe relevant n-grams are:"
         all_parsed_ngrams_for_bm25_queries = []
-        for keyword_idx, keyword in enumerate(keywords):
-            if keyword_idx > 0: lm += " |"
-            lm += f" {keyword} ("
-            ngrams_for_this_keyword_list = []
-            current_ngram_being_built_in_python = ""
-            keyword_ngram_generation_finished = False
-            for rephrase_num in range(self.max_rephrases):
-                first_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_first_token"
-                lm += gen(name=first_token_var, max_tokens=1, stop=[')', ','])
-                
-                if lm[first_token_var] == ')':
-                    keyword_ngram_generation_finished = True; break
-                if lm[first_token_var] == ',':
-                    if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+        if self.generate_n_grams:
+            if self.keyword_alignment:
+                for keyword_idx, keyword in enumerate(keywords):
+                    if keyword_idx > 0: lm += " |"
+                    lm += f" {keyword} ("
+                    ngrams_for_this_keyword_list = []
                     current_ngram_being_built_in_python = ""
-                    if rephrase_num < self.max_rephrases -1 : lm += " "
-                    break 
-
-                current_ngram_being_built_in_python = lm[first_token_var]
-                
-                if lm[first_token_var] not in [')', ',']:
-                    for token_step in range(self.max_keyword_length -1): 
-                        continuations = find_next_word_continuations(current_ngram_being_built_in_python, self.actual_trie_file_path)
-                        valid_next_strings = continuations + [')', ', '] 
-                        if ' ' not in continuations and (not current_ngram_being_built_in_python or current_ngram_being_built_in_python[-1] != ' '):
-                            valid_next_strings.append(' ') 
+                    keyword_ngram_generation_finished = False
+                    for rephrase_num in range(self.max_rephrases):
+                        first_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_first_token"
+                        lm += gen(name=first_token_var, max_tokens=1, stop=[')', ','])
                         
-                        valid_next_strings = list(set(s for s in valid_next_strings if s and s != '|')) 
-                        if not valid_next_strings: valid_next_strings = [')', ', ', ' '] 
-                        
-                        valid_next_strings = self.configure_list_size(valid_next_strings, self.max_trie_continuations)
-                        if not valid_next_strings: valid_next_strings = [')'] 
-
-                        current_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_token_{token_step}"
-                        lm += select(options=valid_next_strings, name=current_token_var)
-                        selected_token_str = lm[current_token_var]
-
-                        if selected_token_str == ')':
-                            if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-                            current_ngram_being_built_in_python = ""; keyword_ngram_generation_finished = True; break 
-                        elif selected_token_str == ', ':
+                        if lm[first_token_var] == ')':
+                            keyword_ngram_generation_finished = True; break
+                        if lm[first_token_var] == ',':
                             if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
                             current_ngram_being_built_in_python = ""
-                            if rephrase_num < self.max_rephrases -1 : lm += " " 
+                            if rephrase_num < self.max_rephrases -1 : lm += " "
                             break 
-                        else:
-                            current_ngram_being_built_in_python += selected_token_str
-                
-                if keyword_ngram_generation_finished: break 
-            
-            if current_ngram_being_built_in_python.strip(): 
-                ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
-            
-            if ngrams_for_this_keyword_list:
-                all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
-            
-            if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 :
-                 lm += ")" 
 
-        ngram_gen_time = time.time() - ngram_gen_start_time
-        print(f"LLM Keyword generation time: {kw_gen_time:.2f}s, N-gram generation time: {ngram_gen_time:.2f}s")
+                        current_ngram_being_built_in_python = lm[first_token_var]
+                        
+                        if lm[first_token_var] not in [')', ',']:
+                            for token_step in range(self.max_keyword_length -1): 
+                                continuations = find_next_word_continuations(current_ngram_being_built_in_python, self.actual_trie_file_path)
+                                valid_next_strings = continuations + [')', ', '] 
+                                if ' ' not in continuations and (not current_ngram_being_built_in_python or current_ngram_being_built_in_python[-1] != ' '):
+                                    valid_next_strings.append(' ') 
+                                
+                                valid_next_strings = list(set(s for s in valid_next_strings if s and s != '|')) 
+                                if not valid_next_strings: valid_next_strings = [')', ', ', ' '] 
+                                
+                                valid_next_strings = self.configure_list_size(valid_next_strings, self.max_trie_continuations)
+                                if not valid_next_strings: valid_next_strings = [')'] 
 
-        # Initial Retrieval (BM25 and FAISS)
+                                current_token_var = f"rephrase_{keyword_idx}_{rephrase_num}_token_{token_step}"
+                                lm += select(options=valid_next_strings, name=current_token_var)
+                                selected_token_str = lm[current_token_var]
+
+                                if selected_token_str == ')':
+                                    if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                                    current_ngram_being_built_in_python = ""; keyword_ngram_generation_finished = True; break 
+                                elif selected_token_str == ', ':
+                                    if current_ngram_being_built_in_python.strip(): ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                                    current_ngram_being_built_in_python = ""
+                                    if rephrase_num < self.max_rephrases -1 : lm += " " 
+                                    break 
+                                else:
+                                    current_ngram_being_built_in_python += selected_token_str
+                        
+                        if keyword_ngram_generation_finished: break 
+                    
+                    if current_ngram_being_built_in_python.strip(): 
+                        ngrams_for_this_keyword_list.append(current_ngram_being_built_in_python.strip())
+                    
+                    if ngrams_for_this_keyword_list:
+                        all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
+                    
+                    if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 :
+                        lm += ")" 
+            else:
+                for keyword_idx, keyword in enumerate(keywords):
+                    if keyword_idx > 0: lm += " |"
+                    lm += f" {keyword} ("
+                    
+                    max_gen_tokens = (self.max_rephrases * self.max_keyword_length * 2) + self.max_rephrases
+                    if max_gen_tokens <= 0: # Ensure max_gen_tokens is at least a small positive number
+                        max_gen_tokens = 50 # Default fallback if parameters lead to zero or negative
+                    unconstrained_ngrams_var = f"unconstrained_ngrams_{keyword_idx}"
+                    lm += gen(
+                        name=unconstrained_ngrams_var, 
+                        stop=[')'],  
+                        max_tokens=max_gen_tokens,
+                        temperature=0.0
+                    )
+                    
+                    generated_ngrams_str = lm[unconstrained_ngrams_var].strip()
+                    
+                    ngrams_for_this_keyword_list = []
+                    if generated_ngrams_str:
+                        parsed_ngrams = [s.strip() for s in generated_ngrams_str.split(',') if s.strip()]
+                        ngrams_for_this_keyword_list = parsed_ngrams[:self.max_rephrases]
+
+                    if ngrams_for_this_keyword_list:
+                        all_parsed_ngrams_for_bm25_queries.append(" ".join(ngrams_for_this_keyword_list))
+                    lm += ")"
+        else:
+            lm += "\nThe relevant n-grams are:" # Maintain prompt structure for LLM
+            if keywords:
+                for keyword_idx, keyword_text in enumerate(keywords):
+                    if keyword_idx > 0:
+                        lm += " |"
+                    lm += f" {keyword_text} ({keyword_text})" # Show keyword as its own "n-gram" in lm
+            else:
+                lm += " No keywords available to use as n-grams." # Or simply an empty line if no keywords
+            
+            all_parsed_ngrams_for_bm25_queries = [kw for kw in keywords if kw.strip()]
+            
         retrieval_start_time = time.time()
         retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
         if all_parsed_ngrams_for_bm25_queries and self.bm25_index_path and os.path.exists(self.bm25_index_path):
@@ -718,8 +770,6 @@ class ARMRetriever(BaseRetriever):
         
         combined_initial_candidates = all_bm25_results_flat + faiss_results_for_query
         retrieval_time = time.time() - retrieval_start_time
-        print(f"Initial BM25 & FAISS retrieval time: {retrieval_time:.2f}s. Candidates: {len(combined_initial_candidates)}")
-
         unique_retrieved_objects_map = {}
         for res_item in combined_initial_candidates:
             doc_id = res_item.metadata.get('id', res_item.object) if isinstance(res_item.metadata, dict) else res_item.object
@@ -796,14 +846,10 @@ class ARMRetriever(BaseRetriever):
         # Batch encode remaining texts for R_i
         unique_texts_needing_Ri = list(set(texts_needing_fresh_encoding_for_Ri)) # Deduplicate
         if unique_texts_needing_Ri:
-            print(f"Batch encoding {len(unique_texts_needing_Ri)} texts for R_i relevance scores...")
             obj_embeddings_tensor = self.embedding_model.encode(
                 unique_texts_needing_Ri, convert_to_tensor=True, show_progress_bar=True, batch_size=128
             )
             obj_embeddings_tensor = obj_embeddings_tensor.to(self.device)
-            # obj_embeddings_np_for_norm = obj_embeddings_tensor.cpu().numpy()
-            # if obj_embeddings_np_for_norm.size > 0: faiss.normalize_L2(obj_embeddings_np_for_norm)
-            # obj_embeddings_tensor = torch.tensor(obj_embeddings_np_for_norm).to(self.device)
 
             if query_embedding_tensor.nelement() > 0 and obj_embeddings_tensor.nelement() > 0:
                 sim_scores_tensor = util.cos_sim(query_embedding_tensor, obj_embeddings_tensor)[0]
@@ -832,21 +878,12 @@ class ARMRetriever(BaseRetriever):
                 'metadata': current_metadata
             })
 
-        relevance_scoring_time = time.time() - relevance_scoring_start_time
-        print(f"Relevance scoring (R_i) time: {relevance_scoring_time:.2f}s. MIP candidates: {len(mip_input_candidates)}")
-
-        # MIP Object Selection
-        mip_solve_start_time = time.time()
         selected_objects_by_mip = []
         if mip_input_candidates:
             selected_objects_by_mip = self._solve_mip_object_selection(
                 candidate_objects=mip_input_candidates,
                 k_select=self.mip_k_select
             )
-        mip_solve_time = time.time() - mip_solve_start_time 
-        print(f"MIP selection (_solve_mip_object_selection) total time: {mip_solve_time:.2f}s")
-
-        # LLM selects from MIP chosen objects
         llm_final_selection_start_time = time.time()
         lm += "\nHere are the objects that can be relevant to answer the user query:\n"
         object_ids_for_llm_selection = []
@@ -857,7 +894,7 @@ class ARMRetriever(BaseRetriever):
                 meta = obj_data_item.get('metadata', {})
                 page_title = meta.get('page_title', f"untitled_{idx}")
                 source_info = meta.get('source', f"unknownsrc_{idx}")
-                object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_") # Clean ID
+                object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_")
 
                 object_ids_for_llm_selection.append(object_llm_id)
                 mip_objects_map_for_final_selection[object_llm_id] = obj_data_item
@@ -867,60 +904,68 @@ class ARMRetriever(BaseRetriever):
         
         lm += "\nFrom the above objects, here are the IDs of those that are enough to answer the query:\n"
         
-        if not selected_objects_by_mip:
-            lm += gen(name='final_eos_for_empty_list', stop="<>", max_tokens=20) 
-        else:
-            lm += gen(name='final_selected_ids_list', stop="\n<>", max_tokens=512) 
+        raw_ids_string_from_llm = ""
         
+        if self.constrained_id_generation:
+            all_possible_id_combinations_strs = []
+            for i in range(1, len(object_ids_for_llm_selection) + 1):
+                for subset_tuple in combinations(object_ids_for_llm_selection, i):
+                    all_possible_id_combinations_strs.append(",".join(subset_tuple))
+            lm += select(options=all_possible_id_combinations_strs, name='final_selected_ids_list')
+        else:
+            lm += gen(name='final_selected_ids_list', stop="\n<>", max_tokens=1024) 
+            
+            
+        raw_ids_string_from_llm = lm['final_selected_ids_list']
         lm += "<>" 
 
         llm_chosen_final_objects = []
-        raw_ids_string_from_llm = lm.get('final_selected_ids_list', '').strip()
-        print(f"LLM raw selected ID string: '{raw_ids_string_from_llm}'")
-
-        if selected_objects_by_mip and raw_ids_string_from_llm and \
-           raw_ids_string_from_llm.lower() not in ["no objects to select from.", 
-                                                   "no specific objects were selected by the solver as most relevant.", 
-                                                   "none", "n/a", ""]:
-            selected_ids_list_from_llm = [id_str.strip().strip("'\"") for id_str in raw_ids_string_from_llm.split(',') if id_str.strip()]
-            print(f"LLM parsed selected IDs: {selected_ids_list_from_llm}")
-            for llm_id in selected_ids_list_from_llm:
-                if llm_id in mip_objects_map_for_final_selection:
-                    llm_chosen_final_objects.append(mip_objects_map_for_final_selection[llm_id])
-                else:
-                    print(f"Warning: LLM selected ID '{llm_id}' which was not in the MIP candidate map presented to it.")
         
-        lm.set('llm_final_selected_objects', llm_chosen_final_objects)
-        llm_final_selection_time = time.time() - llm_final_selection_start_time
+        selected_ids_list_from_llm = [id_str.strip().strip("'\"") for id_str in raw_ids_string_from_llm.split(',') if id_str.strip()]
+        for llm_id in selected_ids_list_from_llm:
+            if llm_id in mip_objects_map_for_final_selection:
+                llm_chosen_final_objects.append(mip_objects_map_for_final_selection[llm_id])
+
+        self.current_llm_selected_objects = llm_chosen_final_objects
         
         total_arm_time = time.time() - start_total_time
-        print(f"LLM final selection processing time: {llm_final_selection_time:.2f}s")
         print(f"Total _perform_arm_retrieval_for_query time: {total_arm_time:.2f}s")
+        print(f"FInal llm output : {lm}")
         return lm
 
 if __name__ == "__main__":
-    arm = ARMRetriever(
-        "/data/hdd1/users/akouk/ARM/ARM/assets/cache/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
-        "assets/feverous/faiss_indexes/dense_row_UAE-Large-V1",
-        "assets/feverous/pyserini_indexes/bm25_row_index",
-        "assets/feverous/trie_indexes"
-    )
-
-    nlqs = [
-        "Aramais Yepiskoposan played for FC Ararat Yerevan, an Armenian football club based in Yerevan during 1986 to 1991."
-    ]
     
+    keyword_alignment_choices = [True, False]
+    generate_n_grams_choices = [True, False]
+    constrained_id_generation_choices = [True, False]
+    for keyword_alignment in keyword_alignment_choices:
+        for generate_n_grams in generate_n_grams_choices:
+            for constrained_id_generation in constrained_id_generation_choices:
+                print(f"Running with keyword_alignment={keyword_alignment}, generate_n_grams={generate_n_grams}, constrained_id_generation={constrained_id_generation}")
+                arm = ARMRetriever(
+                    "/data/hdd1/users/akouk/ARM/ARM/assets/cache/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+                    "assets/feverous/faiss_indexes/dense_row_UAE-Large-V1",
+                    "assets/feverous/pyserini_indexes/bm25_row_index",
+                    "assets/feverous/trie_indexes",
+                    keyword_alignment=keyword_alignment,
+                    generate_n_grams=generate_n_grams,
+                    constrained_id_generation=constrained_id_generation
+                )
+                arm.index(
+                        "assets/feverous/serialized_output/serialized_row_level.jsonl",
+                        output_folder="assets/feverous/arm_indexes/",
+                        field_to_index="object",
+                        metadata_fields =  ["page_title", "source"]
+                    )
+                nlqs = [
+                    "Aramais Yepiskoposan played for FC Ararat Yerevan, an Armenian football club based in Yerevan during 1986 to 1991."
+                ]
+                
+                results : List[List[RetrievalResult]] = []
+                results = arm.retrieve(
+                    nlqs=nlqs,
+                    output_folder="assets/feverous/arm_indexes/",
+                    k=5
+                )
+                print(f"Results: {results}")
     
-    arm.index(
-            "assets/feverous/serialized_output/serialized_row_level.jsonl",
-            output_folder="assets/feverous/arm_indexes/",
-            field_to_index="object",
-            metadata_fields =  ["page_title", "source"]
-        )
-    results : List[List[RetrievalResult]] = []
-    results = arm.retrieve(
-        nlqs=nlqs,
-        output_folder="assets/feverous/arm_indexes/",
-        k=5
-    )
-    print(f"Results: {results}")
