@@ -13,9 +13,11 @@ from pathlib import Path
 import pandas as pd
 import wandb
 import traceback
-from src.retrieval.react import ReActRetriever # Assuming ReActRetriever is in this location
+from src.retrieval.react import ReActRetriever 
+from src.retrieval.arm import ARMRetriever
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_1000.json") # Use Path object
+
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_1000.json")
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
@@ -99,18 +101,15 @@ if __name__ == "__main__":
             #"BM25": lambda: PyseriniBM25Retriever(),
             #"Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
             #"Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
             #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            "ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
+            #"ReAct": lambda: ReActRetriever(dense_model_name_or_path=EMBEDDING_MODEL_NAME, model_path=REACT_LLM_MODEL_PATH)
         }
 
         for name, init_func in retriever_instances.items():
-            try:
-                retriever_instance = init_func()
-                retrievers_for_level.append(retriever_instance)
-                print(f"Successfully initialized {name}")
-            except Exception as e:
-                print(f"Could not initialize {name}: {e}")
+            retriever_instance = init_func()
+            retrievers_for_level.append(retriever_instance)
+            print(f"Successfully initialized {name}")
 
         if not retrievers_for_level:
             print(f"No retrievers initialized for level {index_level}. Skipping level.")

@@ -13,6 +13,9 @@ class PyseriniBM25Retriever(BaseRetriever):
     """
     BM25 Retriever implementation using Pyserini.
     """
+    def __init__(self, enable_tqdm: bool = True):
+        super().__init__()
+        self.enable_tqdm = enable_tqdm
 
     def index(self,
               input_jsonl_path: str,
@@ -129,7 +132,7 @@ class PyseriniBM25Retriever(BaseRetriever):
 
         all_batches: List[List[RetrievalResult]] = []
         # Process results for each query based on the original order
-        for i, nlq in enumerate(tqdm(nlqs, desc="Retrieving with BM25")):
+        for i, nlq in enumerate(tqdm(nlqs, desc="Retrieving with BM25", disable=not self.enable_tqdm)):
             qid = f"q{i}"
             hits = batch_hits.get(qid, []) # Get hits for the current query id
             results: List[RetrievalResult] = []

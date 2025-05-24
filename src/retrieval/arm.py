@@ -1,6 +1,5 @@
 import os
 import pickle
-from dataclasses import field
 from typing import List, Dict, Any, Optional, Set
 from tqdm import tqdm
 import numpy as np
@@ -10,7 +9,7 @@ import marisa_trie
 import guidance
 from guidance import models, gen, select
 from sentence_transformers import SentenceTransformer, util
-from pulp import LpProblem, LpVariable, lpSum, LpMaximize, LpBinary, HiGHS_CMD, PULP_CBC_CMD, GUROBI_CMD
+from pulp import LpProblem, LpVariable, lpSum, LpMaximize, LpBinary, PULP_CBC_CMD, GUROBI_CMD
 from pulp.apis.core import PulpSolverError
 import re
 import textwrap
@@ -52,7 +51,7 @@ class ARMRetriever(BaseRetriever):
                 keyword_alignment :bool = True,
                 generate_n_grams:bool = True,
                 constrained_id_generation:bool = False,
-                expansion_k_compatible: int = 6,
+                expansion_k_compatible: int = 5,
                 expansion_steps: int = 1) -> None:
 
         self.llm_model_path = llm_model_path
@@ -79,7 +78,6 @@ class ARMRetriever(BaseRetriever):
         self.actual_trie_file_path: Optional[str] = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-
         self.llm_model = models.LlamaCpp(
             self.llm_model_path,
             n_gpu_layers=self.llm_n_gpu_layers,
@@ -89,8 +87,8 @@ class ARMRetriever(BaseRetriever):
         self.embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
 
-        self.bm25_retriever = bm25_retriever_instance if bm25_retriever_instance else PyseriniBM25Retriever()
-        self.faiss_dense_retriever = faiss_retriever_instance if faiss_retriever_instance else FaissDenseRetriever(model_name_or_path=self.embedding_model_name)
+        self.bm25_retriever = bm25_retriever_instance if bm25_retriever_instance else PyseriniBM25Retriever(enable_tqdm=False)
+        self.faiss_dense_retriever = faiss_retriever_instance if faiss_retriever_instance else FaissDenseRetriever(model_name_or_path=self.embedding_model_name, enable_tqdm=False)
 
         self.faiss_index: Optional[faiss.Index] = None
         self.faiss_text_to_idx_map: Optional[Dict[str, int]] = None
@@ -264,11 +262,29 @@ class ARMRetriever(BaseRetriever):
         return intersection / min_len if min_len > 0 else 0.0
 
     def _get_semantic_similarity_from_embeddings(self, emb1: Optional[torch.Tensor], emb2: Optional[torch.Tensor]) -> float:
-        if emb1 is None or emb2 is None or emb1.nelement() == 0 or emb2.nelement() == 0:
+        if emb1 is None or emb2 is None:
             return 0.0
         
-        current_emb1 = emb1.to(self.device) if emb1.device != self.device else emb1
-        current_emb2 = emb2.to(self.device) if emb2.device != self.device else emb2
+        if isinstance(emb1, np.ndarray):
+            if emb1.size == 0: return 0.0
+            emb1_tensor = torch.tensor(emb1, dtype=torch.float32)
+        elif isinstance(emb1, torch.Tensor):
+            if emb1.nelement() == 0: return 0.0
+            emb1_tensor = emb1
+        else: 
+            return 0.0
+
+        if isinstance(emb2, np.ndarray):
+            if emb2.size == 0: return 0.0 
+            emb2_tensor = torch.tensor(emb2, dtype=torch.float32)
+        elif isinstance(emb2, torch.Tensor):
+            if emb2.nelement() == 0: return 0.0
+            emb2_tensor = emb2
+        else: 
+            return 0.0
+        
+        current_emb1 = emb1_tensor.to(self.device) if emb1_tensor.device != self.device else emb1_tensor
+        current_emb2 = emb2_tensor.to(self.device) if emb2_tensor.device != self.device else emb2_tensor
 
         if current_emb1.ndim == 1: current_emb1 = current_emb1.unsqueeze(0)
         if current_emb2.ndim == 1: current_emb2 = current_emb2.unsqueeze(0)
@@ -763,11 +779,10 @@ class ARMRetriever(BaseRetriever):
         unique_retrieved_objects_map = {}
         for res_item in combined_initial_candidates:
             current_meta = res_item.metadata if isinstance(res_item.metadata, dict) else {}
-            doc_id = current_meta.get('id', res_item.object) # Prefer 'id' from metadata
-            
+            doc_id = res_item.object # Always use the content as the ID
             if doc_id not in unique_retrieved_objects_map:
                 unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_score': res_item.score, 'metadata': current_meta}
-            else: 
+            else:
                 unique_retrieved_objects_map[doc_id]['max_score'] = max(
                     unique_retrieved_objects_map[doc_id]['max_score'], res_item.score
                 )
@@ -786,16 +801,6 @@ class ARMRetriever(BaseRetriever):
         for data_item in unique_retrieved_objects_map.values():
             texts_for_global_Ri_calc.add(data_item['doc'].object)
 
-        if self.expansion_compatibility_data and self.expansion_steps > 0:
-            potential_expansion_obj_ids_processed = set()
-            for data_item in unique_retrieved_objects_map.values():
-                base_obj_id = data_item['metadata'].get('id', data_item['doc'].object)
-                if base_obj_id in self.expansion_compatibility_data:
-                    for comp_obj_info in self.expansion_compatibility_data[base_obj_id]:
-                        if comp_obj_info['id'] not in potential_expansion_obj_ids_processed:
-                            texts_for_global_Ri_calc.add(comp_obj_info['text'])
-                            potential_expansion_obj_ids_processed.add(comp_obj_info['id'])
-        
         unique_texts_list_for_global_Ri = list(texts_for_global_Ri_calc)
         global_relevance_scores_map: Dict[str, float] = {}
         
@@ -844,7 +849,7 @@ class ARMRetriever(BaseRetriever):
         initial_mip_input_candidates = []
         for doc_id, data_item in unique_retrieved_objects_map.items():
             doc_object_text = data_item['doc'].object
-            relevance_score_R_i = global_relevance_scores_map.get(doc_object_text, 0.0) 
+            relevance_score_R_i = global_relevance_scores_map.get(doc_object_text, 0.0)
 
             current_metadata = data_item['metadata']
             source_str = current_metadata.get('source', 'unknown_source')
@@ -854,7 +859,7 @@ class ARMRetriever(BaseRetriever):
                 parsed_content_val = self._parse_table_object_string(doc_object_text)
             
             initial_mip_input_candidates.append({
-                'id': doc_id, # This is the crucial ID
+                'id': doc_id, # This is content
                 'text': doc_object_text,
                 'source_type': source_type,
                 'parsed_content': parsed_content_val,
@@ -864,27 +869,65 @@ class ARMRetriever(BaseRetriever):
 
         # Expansion Step
         expanded_candidates_dict = {obj['id']: obj for obj in initial_mip_input_candidates}
-        if self.expansion_compatibility_data and self.expansion_steps > 0:
+        if self.expansion_steps > 0:
             current_candidates_to_expand_from = list(initial_mip_input_candidates)
             for step in range(self.expansion_steps):
                 newly_added_in_this_step_list = []
-                for base_obj in current_candidates_to_expand_from:
-                    base_obj_id = base_obj['id']
-                    if base_obj_id in self.expansion_compatibility_data:
-                        for comp_obj_info_template in self.expansion_compatibility_data[base_obj_id]:
-                            comp_obj_id = comp_obj_info_template['id']
-                            if comp_obj_id not in expanded_candidates_dict:
-                                new_candidate = comp_obj_info_template.copy() 
-                                new_candidate['relevance_score_R_i'] = global_relevance_scores_map.get(new_candidate['text'], 0.0)
-                                expanded_candidates_dict[comp_obj_id] = new_candidate
-                                newly_added_in_this_step_list.append(new_candidate)
+                expansion_queries = [base_obj['text'] for base_obj in current_candidates_to_expand_from if base_obj['text']]
+
+                bm25_expansion_results_nested = self.bm25_retriever.retrieve(
+                    nlqs=expansion_queries,
+                    output_folder=self.bm25_index_path,
+                    k=self.expansion_k_compatible
+                )
+
+                # Process the results of BM25 expansion
+                for i, base_obj_text_queried in enumerate(expansion_queries):
+                    bm25_retrieved_for_this_base_obj = bm25_expansion_results_nested[i]
+                    
+                    for bm25_res_item in bm25_retrieved_for_this_base_obj:
+                        expanded_content_as_key = bm25_res_item.object 
+
+                        if expanded_content_as_key not in expanded_candidates_dict:
+                            expanded_relevance_score_R_i = 0.0
+                            if expanded_content_as_key in global_relevance_scores_map:
+                                expanded_relevance_score_R_i = global_relevance_scores_map[expanded_content_as_key]
+                            else:
+                                if query_embedding_tensor.nelement() > 0:
+                                    expanded_item_emb_np = self.faiss_dense_retriever.faiss_encode(
+                                        [expanded_content_as_key], 
+                                        self.faiss_index_path 
+                                    )
+                                    expanded_item_emb = torch.tensor(expanded_item_emb_np).to(self.device)
+                                    if expanded_item_emb.ndim == 1: expanded_item_emb = expanded_item_emb.unsqueeze(0)
+                                    if expanded_item_emb.nelement() > 0:
+                                        sim_score = util.cos_sim(query_embedding_tensor, expanded_item_emb).item()
+                                        expanded_relevance_score_R_i = (sim_score + 1) / 2.0
+                                global_relevance_scores_map[expanded_content_as_key] = expanded_relevance_score_R_i # Cache it
+
+                            temp_meta = bm25_res_item.metadata if isinstance(bm25_res_item.metadata, dict) else {}
+                            temp_source_str = temp_meta.get('source', 'unknown_source_bm25_expanded')
+                            temp_source_type = 'table' if 'table' in temp_source_str.lower() else 'passage'
+                            temp_parsed_content = None
+                            if temp_source_type == 'table':
+                                temp_parsed_content = self._parse_table_object_string(expanded_content_as_key)
+
+                            mip_formatted_new_candidate = {
+                                'id': expanded_content_as_key, # Use content as the ID
+                                'text': expanded_content_as_key,
+                                'source_type': temp_source_type,
+                                'parsed_content': temp_parsed_content,
+                                'relevance_score_R_i': expanded_relevance_score_R_i,
+                                'metadata': temp_meta
+                            }
+                            expanded_candidates_dict[expanded_content_as_key] = mip_formatted_new_candidate
+                            newly_added_in_this_step_list.append(mip_formatted_new_candidate)
                 
                 if not newly_added_in_this_step_list:
-                    break 
+                    break
                 current_candidates_to_expand_from = newly_added_in_this_step_list
         
         final_mip_candidates = list(expanded_candidates_dict.values())
-        
         selected_objects_by_mip = []
         if final_mip_candidates:
             selected_objects_by_mip = self._solve_mip_object_selection(
@@ -937,9 +980,6 @@ class ARMRetriever(BaseRetriever):
 
         self.current_llm_selected_objects = llm_chosen_final_objects
         
-        total_arm_time = time.time() - start_total_time
-        print(f"Total _perform_arm_retrieval_for_query time: {total_arm_time:.2f}s")
-        print(f"Final llm output : {lm}")
         return lm
 """
 if __name__ == "__main__":
@@ -988,7 +1028,10 @@ if __name__ == "__main__":
         "assets/feverous/trie_indexes",
         keyword_alignment=True,
         generate_n_grams=False,
-        constrained_id_generation=True
+        constrained_id_generation=True,
+        mip_k_select = 10,
+        expansion_k_compatible=3,
+        expansion_steps=1
     )
     
     arm.index(

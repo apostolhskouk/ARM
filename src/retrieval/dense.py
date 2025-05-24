@@ -16,7 +16,7 @@ class FaissDenseRetriever(BaseRetriever):
     INDEX_FILENAME = "index.faiss"
     METADATA_FILENAME = "metadata.pkl"
 
-    def __init__(self, model_name_or_path: str = "WhereIsAI/UAE-Large-V1"):
+    def __init__(self, model_name_or_path: str = "WhereIsAI/UAE-Large-V1", enable_tqdm: bool = True):
         """
         Initializes the retriever with a Sentence Transformer model.
 
@@ -27,6 +27,12 @@ class FaissDenseRetriever(BaseRetriever):
         self.model = SentenceTransformer(model_name_or_path, device='cpu')
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         self.num_gpus = torch.cuda.device_count()
+
+        self.faiss_index_cpu: Optional[faiss.Index] = None
+        self.doc_metadata_list: Optional[List[Dict[str, Any]]] = None
+        self.text_to_id_map: Optional[Dict[str, int]] = None
+        self._loaded_output_folder: Optional[str] = None
+        self.enable_tqdm = enable_tqdm
 
     def index(self,
               input_jsonl_path: str,
@@ -124,7 +130,7 @@ class FaissDenseRetriever(BaseRetriever):
             query_embeddings = self.model.encode(
                 nlqs,
                 batch_size=128,
-                show_progress_bar=True,
+                show_progress_bar=False,
                 convert_to_numpy=True
             )
             faiss.normalize_L2(query_embeddings)
@@ -142,7 +148,7 @@ class FaissDenseRetriever(BaseRetriever):
         all_batches: List[List[RetrievalResult]] = []
         num_docs_in_index = len(doc_metadata_list)
 
-        for qi, nlq in enumerate(tqdm(nlqs, desc="Retrieving with FAISS")):
+        for qi, nlq in enumerate(tqdm(nlqs, desc="Retrieving with FAISS", disable=not self.enable_tqdm)):
             batch_results: List[RetrievalResult] = []
             if qi >= len(indices) or qi >= len(scores):
                  print(f"Warning: Mismatch in FAISS search results length for query index {qi}. Skipping.")
@@ -191,4 +197,56 @@ class FaissDenseRetriever(BaseRetriever):
         torch.cuda.empty_cache()
         if res:
             del res  
-        return all_batches
+        return all_batches        
+
+
+    def faiss_encode(self, sentences: List[str], output_folder: str, batch_size: int = 32, show_progress_bar: bool = False) -> np.ndarray:
+        if self.text_to_id_map is None:
+            index_path = os.path.join(output_folder, self.INDEX_FILENAME)
+            metadata_path = os.path.join(output_folder, self.METADATA_FILENAME)
+
+            self.faiss_index_cpu = faiss.read_index(index_path)
+            with open(metadata_path, 'rb') as f:
+                self.doc_metadata_list = pickle.load(f)
+            
+            self.text_to_id_map = {
+                meta['_text']: i 
+                for i, meta in enumerate(self.doc_metadata_list) 
+                if isinstance(meta.get('_text'), str)
+            }
+            
+        
+        if not sentences:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        
+        results_list = [None] * len(sentences)
+        indices_to_encode_newly = []
+        sentences_to_encode_newly_map = {} 
+
+        for i, sentence in enumerate(sentences):
+            if sentence in self.text_to_id_map:
+                doc_id = self.text_to_id_map[sentence]
+                embedding = self.faiss_index_cpu.reconstruct(doc_id).copy()
+                results_list[i] = embedding
+            else:
+                indices_to_encode_newly.append(i)
+                sentences_to_encode_newly_map[i] = sentence
+        if sentences_to_encode_newly_map:
+            ordered_sentences_to_encode = [sentences_to_encode_newly_map[i] for i in indices_to_encode_newly]
+            
+            new_embeddings = self.model.encode(
+                ordered_sentences_to_encode,
+                batch_size=batch_size,
+                show_progress_bar=show_progress_bar,
+                convert_to_numpy=True
+            )
+            
+            if new_embeddings.ndim == 1 and len(ordered_sentences_to_encode) == 1:
+                new_embeddings = np.expand_dims(new_embeddings, axis=0)
+            
+            faiss.normalize_L2(new_embeddings)
+
+            for i, original_idx in enumerate(indices_to_encode_newly):
+                results_list[original_idx] = new_embeddings[i]
+        
+        return np.array(results_list, dtype=np.float32)

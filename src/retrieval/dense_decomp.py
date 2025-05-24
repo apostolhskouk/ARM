@@ -3,8 +3,8 @@ from collections import Counter
 from src.retrieval.base import RetrievalResult
 from src.retrieval.dense import FaissDenseRetriever
 from src.utils.query_decompostion import QueryDecomposer
+from src.utils.query_decomposition_vllm import QueryDecomposer as VLLMQueryDecomposer
 from tqdm import tqdm
-USE_VLLM = False
 class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     """
     Extends FaissDenseRetriever to perform query decomposition before retrieval.
@@ -14,18 +14,20 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         self,
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
         model_name: str = "llama3.1:8b",
-        decomposition_cache_folder: Optional[str] = None
+        decomposition_cache_folder: Optional[str] = None,
+        use_vllm: bool = False
     ):
         super().__init__(model_name_or_path=embedding_model_name)
-        try:
+        self.use_vllm = use_vllm
+        if not self.use_vllm:
             self.decomposer = QueryDecomposer(
                 model_name,
                 output_folder=decomposition_cache_folder
             )
-        except Exception as e:
-            # Keep original error handling style
-            print(f"Failed to initialize QueryDecomposer: {e}")
-            raise
+        else:
+            self.decomposer = VLLMQueryDecomposer(
+                output_folder=decomposition_cache_folder
+            )
 
     def retrieve(
         self,
@@ -40,7 +42,7 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         if not nlqs:
             return []
 
-        if USE_VLLM:
+        if self.use_vllm:
             decomposed_nlqs_batch: List[List[str]] = self.decomposer.decompose_batch(nlqs)
     
             all_sub_queries: List[str] = []

@@ -12,7 +12,7 @@ class QueryDecomposer:
                  output_folder: Optional[str] = None,
                  tensor_parallel_size: int = 2,
                  quantization: Optional[str] = "fp8",
-                 gpu_memory_utilization: float = 0.85,
+                 gpu_memory_utilization: float = 0.65,
                  enable_prefix_caching: bool = True,
                  trust_remote_code: bool = True,
                  max_tokens: int = 4096,
@@ -33,7 +33,7 @@ class QueryDecomposer:
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name_or_path,
             trust_remote_code=trust_remote_code,
-            cache_dir="/data/hdd1/users/akouk/value_linking/fresh_value_linking/experimental-analysis-of-value-inking/assets/cache"
+            cache_dir="/data/hdd1/vllm_models/"
         )
         self.llm = LLM(
             model=self.model_name_or_path,
@@ -42,7 +42,7 @@ class QueryDecomposer:
             gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            download_dir="/data/hdd1/users/akouk/value_linking/fresh_value_linking/experimental-analysis-of-value-inking/assets/cache"
+            download_dir="/data/hdd1/vllm_models/"
         )
         self.sampling_params = SamplingParams(
             temperature=temperature,
