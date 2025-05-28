@@ -711,8 +711,8 @@ class ARMRetriever(BaseRetriever):
                     
                     if not keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 : # This was missing a check for last keyword
                          lm += ")"
-                    elif keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 and lm.current_text[-1] != ')': # Ensure ')' if loop broke early
-                         lm += ")"
+                    #elif keyword_ngram_generation_finished and keyword_idx < len(keywords) -1 and lm.current_text[-1] != ')': # Ensure ')' if loop broke early
+                    #     lm += ")"
 
             else: 
                 for keyword_idx, keyword in enumerate(keywords):
@@ -753,6 +753,7 @@ class ARMRetriever(BaseRetriever):
         
         retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
         if all_parsed_ngrams_for_bm25_queries and self.bm25_index_path and os.path.exists(self.bm25_index_path):
+            print(f"Retrieving with {all_parsed_ngrams_for_bm25_queries}")
             retrieved_docs_by_bm25_nested = self.bm25_retriever.retrieve(
                 nlqs=all_parsed_ngrams_for_bm25_queries,
                 output_folder=self.bm25_index_path, 
@@ -979,7 +980,7 @@ class ARMRetriever(BaseRetriever):
                 llm_chosen_final_objects.append(mip_objects_map_for_final_selection[llm_id])
 
         self.current_llm_selected_objects = llm_chosen_final_objects
-        
+        print(f"LLM answer is:\n{lm}")
         return lm
 """
 if __name__ == "__main__":
@@ -1030,7 +1031,7 @@ if __name__ == "__main__":
         generate_n_grams=False,
         constrained_id_generation=True,
         mip_k_select = 10,
-        expansion_k_compatible=3,
+        expansion_k_compatible=0,
         expansion_steps=1
     )
     
