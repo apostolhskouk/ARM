@@ -21,13 +21,14 @@ from train_utils.processor import FastPrefixConstrainedLogitsProcessor, Trie_lin
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from train_utils.utils import get_ctrl_item 
 import json as json_loader
+from vllm import LLM as VLLM_Engine, SamplingParams as VLLM_SamplingParams
 
 class ARMRetriever(BaseRetriever):
     FAISS_INDEX_FILENAME = "index.faiss"
     FAISS_METADATA_FILENAME = "metadata.pkl"
 
     def __init__(self,
-                llm_model_path: str,
+                vllm_model_path: str,
                 faiss_index_path: str,
                 bm25_index_path: str,
                 embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
@@ -56,7 +57,10 @@ class ARMRetriever(BaseRetriever):
                 ngram_llm_model_path: Optional[str] = None, # Path to HF model for n-gram generation
                 ngram_llm_tokenizer_path: Optional[str] = None, # Path to its tokenizer
                 max_ngrams_generated_per_keyword: int = 5,
-                max_new_tokens_for_ngram_gen: int = 100
+                max_new_tokens_for_ngram_gen: int = 100,
+                vllm_tensor_parallel_size: int = 1,
+                vllm_cache_dir: str = "/data/hdd1/vllm_models/",
+                vllm_quantization: Optional[str] = None,
                 ) -> None:
 
         self.faiss_index_path = faiss_index_path
@@ -97,7 +101,7 @@ class ARMRetriever(BaseRetriever):
         self.expansion_k_compatible = expansion_k_compatible
         self.expansion_steps = expansion_steps
 
-        self.ngram_llm_model_path = ngram_llm_model_path if ngram_llm_model_path else llm_model_path # Default to main LLM if not specified
+        self.ngram_llm_model_path = ngram_llm_model_path
         self.ngram_llm_tokenizer_path = ngram_llm_tokenizer_path if ngram_llm_tokenizer_path else self.ngram_llm_model_path
 
         self.ngram_llm_tokenizer: Optional[AutoTokenizer] = None
@@ -107,10 +111,35 @@ class ARMRetriever(BaseRetriever):
         self.max_ngrams_generated_per_keyword = max_ngrams_generated_per_keyword
         self.max_new_tokens_for_ngram_gen = max_new_tokens_for_ngram_gen
 
+        self.vllm_model_path = vllm_model_path
+        self.vllm_engine: Optional[VLLM_Engine] = None
+        self.vllm_sampling_params: Optional[VLLM_SamplingParams] = None
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_cache_dir = vllm_cache_dir
+        if self.vllm_model_path:
+            self._initialize_vllm()
+
         if self.generate_n_grams:
             self._initialize_ngram_llm_components()
             
-    
+    def _initialize_vllm(self): 
+        tokenizer = AutoTokenizer.from_pretrained(self.vllm_model_path, trust_remote_code=True, cache_dir=self.vllm_cache_dir)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if self.vllm_model_path:
+            self.vllm_engine = VLLM_Engine(
+                model=self.vllm_model_path,
+                tensor_parallel_size=self.vllm_tensor_parallel_size,
+                tokenizer=tokenizer.name_or_path,
+                download_dir=self.vllm_cache_dir,
+                quantization=self.vllm_quantization,
+                gpu_memory_utilization=0.9, 
+            )
+            print("vLLM engine initialized.")
+        else:
+            print("vLLM model path not provided. Skipping vLLM initialization.")
+            
+            
     def _initialize_ngram_llm_components(self):
         self.ngram_llm_tokenizer = AutoTokenizer.from_pretrained(self.ngram_llm_tokenizer_path)
         self.ngram_llm_model = AutoModelForCausalLM.from_pretrained(
@@ -163,18 +192,21 @@ class ARMRetriever(BaseRetriever):
 
     def _extract_ngrams_for_trie(self, input_jsonl_path: str, field_to_index: str) -> List[str]:
         all_ngrams = set()
-        with open(input_jsonl_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Extracting n-grams for Trie_link construction"):
-                record = json_loader.loads(line)
-                text_content = record.get(field_to_index)
-                if isinstance(text_content, str) and text_content.strip():
-                    # Simple tokenization, can be improved (e.g., using self.ngram_llm_tokenizer.tokenize)
-                    tokens = text_content.lower().split() 
-                    for n_val in range(self.trie_min_n_for_extraction, self.trie_max_n_for_extraction + 1):
-                        for i in range(len(tokens) - n_val + 1):
-                            ngram = " ".join(tokens[i:i+n_val])
-                            if ngram: # Ensure non-empty n-gram
-                                all_ngrams.add(ngram)
+        try:
+            with open(input_jsonl_path, 'r', encoding='utf-8') as f:
+                for line in tqdm(f, desc="Extracting n-grams for Trie_link construction"):
+                    record = json_loader.loads(line)
+                    text_content = record.get(field_to_index)
+                    if isinstance(text_content, str) and text_content.strip():
+                        tokens = self.ngram_llm_tokenizer.tokenize(text_content.lower())
+                        for n_val in range(self.trie_min_n_for_extraction, self.trie_max_n_for_extraction + 1):
+                            for i in range(len(tokens) - n_val + 1):
+                                ngram_tokens = tokens[i:i+n_val]
+                                ngram_str = self.ngram_llm_tokenizer.convert_tokens_to_string(ngram_tokens)
+                                if ngram_str.strip(): 
+                                    all_ngrams.add(ngram_str.strip())
+        except Exception as e:
+            print(f"Error extracting n-grams: {e}")
         return list(all_ngrams)
 
 
@@ -698,8 +730,117 @@ class ARMRetriever(BaseRetriever):
         The relevant keywords are: """)
      
     
-    def _perform_arm_retrieval_for_query(self, lm, user_query: str): # lm is the guidance model state
-        pass
+    def _get_keyword_generation_prompt_vllm(self, user_query: str) -> str:
+        return textwrap.dedent(f"""
+            You are given a user question. Your task is to generate relevant keywords that can be used to retrieve information related to the user question.
+            User question: {user_query}
+            The relevant keywords are:""")
+        
+    def _perform_arm_retrieval_for_query(self, user_query: str):
+        print(f"--- Starting Keyword and N-gram Generation for query: '{user_query}' ---")
+        keywords: List[str] = []
+        all_final_ngrams_for_retrieval: List[str] = []
+
+        # 1. Keyword Generation using vLLM
+        if self.vllm_engine:
+            keyword_prompt = self._get_keyword_generation_prompt_vllm(user_query)
+            
+            # Define SamplingParams for this specific keyword generation task
+            keyword_sampling_params = VLLM_SamplingParams(
+                temperature=0.0, 
+                max_tokens=150,  
+                stop=["\n", "<|eot_id|>", "The relevant n-grams are:"] 
+            )
+            
+            vllm_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params)
+            
+            if vllm_outputs and vllm_outputs[0].outputs:
+                generated_keywords_text = vllm_outputs[0].outputs[0].text.strip()
+                # Post-process to remove any part of the stop sequence if it's included
+                for stop_seq in keyword_sampling_params.stop:
+                    if stop_seq in generated_keywords_text:
+                        generated_keywords_text = generated_keywords_text.split(stop_seq)[0]
+                
+                keywords = [k.strip() for k in generated_keywords_text.split('|') if k.strip()][:self.max_keywords_per_query]
+                print(f"vLLM Generated Keywords: {keywords}")
+            else:
+                print("Warning: vLLM failed to generate keywords. Using full query as a keyword.")
+                keywords = [user_query] if user_query.strip() else []
+        else:
+            print("Warning: vLLM engine not initialized. Using full query as a keyword.")
+            keywords = [user_query] if user_query.strip() else []
+
+        # 2. N-gram Generation using RecLM-cgen (HF Transformers) for each keyword
+        if self.generate_n_grams:
+            if self.ngram_llm_model and self.ngram_llm_tokenizer and self.ngram_logits_processor:
+                system_message_ngram = "You are an expert in identifying relevant n-grams. When you generate an n-gram, it should be enclosed by <SOI> and <EOI>."
+                user_message_ngram_template = "Given the keyword '{keyword}', provide a list of the most relevant n-grams. Each n-gram must be enclosed by <SOI> and <EOI>."
+                
+                for keyword_text in keywords:
+                    if not keyword_text: continue
+
+                    current_keyword_ngrams_list: List[str] = []
+                    user_message_ngram = user_message_ngram_template.format(keyword=keyword_text)
+                    
+                    if hasattr(self.ngram_llm_tokenizer, 'apply_chat_template') and "llama-3" in self.ngram_llm_tokenizer_path.lower():
+                        chat_for_ngram = [
+                            {"role": "system", "content": system_message_ngram},
+                            {"role": "user", "content": user_message_ngram}
+                        ]
+                        prompt_text_ngram = self.ngram_llm_tokenizer.apply_chat_template(
+                            chat_for_ngram, tokenize=False, add_generation_prompt=True
+                        )
+                    else: 
+                        prompt_text_ngram = f"System: {system_message_ngram}\nUser: {user_message_ngram}\nAssistant:"
+
+                    input_data_ngram = self.ngram_llm_tokenizer(
+                        prompt_text_ngram, 
+                        return_tensors="pt", 
+                        truncation=True, 
+                        max_length=512 
+                    ).to(self.device)
+                    
+                    input_ids_length_ngram = input_data_ngram['input_ids'].shape[1]
+
+                    with torch.no_grad():
+                        output_ids_ngram = self.ngram_llm_model.generate(
+                            **input_data_ngram,
+                            logits_processor=[self.ngram_logits_processor],
+                            max_new_tokens=self.max_new_tokens_for_ngram_gen,
+                            num_beams=1, 
+                            eos_token_id=self.ngram_llm_tokenizer.eos_token_id,
+                            pad_token_id=self.ngram_llm_tokenizer.pad_token_id,
+                            do_sample=False 
+                        )
+                    
+                    generated_text_ngram_assistant_part = self.ngram_llm_tokenizer.decode(
+                        output_ids_ngram[0, input_ids_length_ngram:], skip_special_tokens=False
+                    )
+
+                    parsed_ngrams_from_llm = get_ctrl_item(generated_text_ngram_assistant_part)
+                    current_keyword_ngrams_list.extend(parsed_ngrams_from_llm[:self.max_ngrams_generated_per_keyword])
+                    
+                    if current_keyword_ngrams_list:
+                        all_final_ngrams_for_retrieval.append(" ".join(current_keyword_ngrams_list))
+                        print(f"  N-grams for '{keyword_text}': {current_keyword_ngrams_list}")
+                    else:
+                        all_final_ngrams_for_retrieval.append(keyword_text) 
+                        print(f"  No n-grams generated for '{keyword_text}', using keyword itself.")
+            else:
+                print("Warning: N-gram LLM components not fully initialized. Using keywords as n-grams.")
+                all_final_ngrams_for_retrieval = [kw for kw in keywords if kw]
+        else: 
+            print("N-gram generation disabled. Using keywords as n-grams.")
+            all_final_ngrams_for_retrieval = [kw for kw in keywords if kw]
+
+        self.current_keywords = keywords
+        self.current_ngrams_for_retrieval = all_final_ngrams_for_retrieval
+        
+        print(f"--- Keyword and N-gram Generation Complete ---")
+        print(f"Keywords: {self.current_keywords}")
+        print(f"N-gram sets for retrieval: {self.current_ngrams_for_retrieval}")
+
+        return 
 """
 if __name__ == "__main__":
     
