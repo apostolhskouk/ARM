@@ -4,7 +4,7 @@ from typing import List, Dict, Optional, Set
 from tqdm import tqdm
 import torch
 import faiss
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 import textwrap
 from src.retrieval.base import BaseRetriever, RetrievalResult
 from src.retrieval.bm25 import PyseriniBM25Retriever
@@ -12,13 +12,15 @@ from src.retrieval.dense import FaissDenseRetriever
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import LLM as VLLM_Engine, SamplingParams as VLLM_SamplingParams
 import json 
-from src.utils.recai_recommender import Trie_link, FastPrefixConstrainedLogitsProcessor
+from src.utils.recai_recommender import Trie_link, FastPrefixConstrainedLogitsProcessor, Node
 from src.utils.text_precessor import simple_tokenize, generate_ngrams
 from nltk.tokenize import word_tokenize 
 import random
 from collections import Counter
 from nltk.corpus import stopwords
 from src.utils.mip_solver import MIPSolver
+import numpy as np
+import time
 
 class ARMRetriever(BaseRetriever):
     FAISS_INDEX_FILENAME = "index.faiss"
@@ -42,7 +44,7 @@ class ARMRetriever(BaseRetriever):
                 keyword_alignment :bool = True,
                 generate_n_grams:bool = True,
                 constrained_id_generation:bool = False,
-                expansion_k_compatible: int = 5,
+                expansion_k_compatible: int = 3,
                 expansion_steps: int = 1,
                 keyword_rephrasing_beams: int = 1,
                 vllm_tensor_parallel_size: int = 2,
@@ -50,7 +52,8 @@ class ARMRetriever(BaseRetriever):
                 vllm_quantization: Optional[str] = None,
                 filter_ngrams_against_corpus: bool = True,
                 arm_cache_dir: str = "assets/arm/",
-                keywords_per_query: int = 10
+                keywords_per_query: int = 10,
+                alignment_retrieval_k: int = 5,
                 ) -> None:
 
         self.faiss_index_path = faiss_index_path
@@ -74,7 +77,6 @@ class ARMRetriever(BaseRetriever):
         self.faiss_index: Optional[faiss.Index] = None
         self.faiss_text_to_idx_map: Optional[Dict[str, int]] = None
         self.max_keyword_length = max_keyword_length
-        self.keyword_alignment = keyword_alignment
         self.generate_n_grams = generate_n_grams
         self.current_keywords: List[str] = []
         self.current_ngrams_for_retrieval: List[str] = []
@@ -111,6 +113,9 @@ class ARMRetriever(BaseRetriever):
             compatibility_semantic_weight=self.compatibility_semantic_weight,
             compatibility_exact_weight=self.compatibility_exact_weight
         )
+        self.alignment_retrieval_k = alignment_retrieval_k
+        self.expansion_k_compatible = expansion_k_compatible
+        self.expansion_steps = expansion_steps
         
     def _initialize_vllm(self): 
         tokenizer = AutoTokenizer.from_pretrained(self.vllm_model_path, trust_remote_code=True, cache_dir=self.vllm_cache_dir)
@@ -124,9 +129,8 @@ class ARMRetriever(BaseRetriever):
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
                 gpu_memory_utilization=0.8, 
-                max_model_len=2048,
+                max_model_len=16384,
             )
-            print("vLLM engine initialized.")
         else:
             print("vLLM model path not provided. Skipping vLLM initialization.")
             
@@ -162,7 +166,6 @@ class ARMRetriever(BaseRetriever):
         cache_filename = f"trie_cache_{sanitized_input_basename}_min{self.corpus_ngram_min_len}_max{self.corpus_ngram_max_len}.pkl"
         cache_filepath = os.path.join(self.arm_cache_dir, cache_filename)
         if os.path.exists(cache_filepath): 
-            print(f"Loading trie from cache: {cache_filepath}") 
             with open(cache_filepath, 'rb') as f: 
                 self.item_prefix_trie = pickle.load(f) 
             self.item_prefix_trie.tokenizer = self.ngram_llm_tokenizer 
@@ -170,7 +173,6 @@ class ARMRetriever(BaseRetriever):
                 self.item_prefix_trie.constrain_search_list, 
                 num_beams=self.keyword_rephrasing_beams 
             ) 
-            print("Trie and logits processor loaded from cache.") 
             return
         
         with open(input_jsonl_path_for_ngrams, 'r', encoding='utf-8') as f:
@@ -204,7 +206,6 @@ class ARMRetriever(BaseRetriever):
 
         with open(cache_filepath, 'wb') as f: 
             pickle.dump(self.item_prefix_trie, f) 
-        print(f"Trie saved to cache: {cache_filepath}") 
         
 
     def _load_faiss_assets(self, faiss_folder_path: str) -> bool:
@@ -262,9 +263,7 @@ class ARMRetriever(BaseRetriever):
         
         all_query_results: List[List[RetrievalResult]] = []
         for nlq in tqdm(nlqs, desc="Processing queries", unit="query"):
-            self._perform_arm_retrieval_for_query(nlq)
-            break
-            final_chosen_objects = self.current_llm_selected_objects
+            final_chosen_objects = self._perform_arm_retrieval_for_query(nlq)
             
             query_results: List[RetrievalResult] = []
             
@@ -278,42 +277,51 @@ class ARMRetriever(BaseRetriever):
                 )
             
             all_query_results.append(query_results)
-
         return all_query_results
 
     
     @staticmethod
-    def _get_initial_prompt_string(user_query: str) -> str:
-     return textwrap.dedent(f"""
-        You are given a user question. Your task is to:
-        1. Decompose the user question into contiguous, non-overlapping substrings that can cover different information mentioned in the user question.
-        2. For each substring, generate n-grams that are the most relevant to the substring. Prefer lengthy n-grams over short ones.
-        3. Based on the generated relevant n-grams, identify and list candidate objects that could be relevant. Each object must be serialized with an `Id`, a `Name`, and `Content`. The `Content` can be a sentence or structured data (e.g., from a table, where `[H]` might denote a header element and `[SEP]` acts as a general separator between the object name and its content, or between parts of the content). The format for each object should be: `Id: 'object_id' Object_Name [SEP] Object_Content`. The object_id must follow the pattern `Title_sentence_index` or `Title_table_index`. Present this list under the heading "Here are the objects that can be relevant to answer the user query:".
-        4. From the list of candidate objects you've generated in step 3, you must identify and then list *only the IDs* of the *minimum number* of objects that are *collectively sufficient* to fully answer the user question. Critically evaluate each candidate object: select an object *only if it is essential* for answering a part of the question and its information is not adequately covered by other selected objects. Aim for the smallest possible set of IDs. Present this list of comma-separated IDs under the heading "From the above objects, here are the IDs of those that are enough to answer the query:".
-        Your entire response, including all these parts, should end with <>.
+    def _get_final_selection_prompt(user_query: str, keywords_string: str, serialized_objects: str) -> str:
+        return textwrap.dedent(f"""
+            You are given a user question and a pre-assembled list of candidate objects. Your goal is to pick the smallest set of objects that fully answer the question.
 
-        User question: What was the lead single from the album 'Echoes of Tomorrow' by The Cosmic Rays, and in what year was this album released?
-        The relevant keywords are lead single | album 'Echoes of Tomorrow' | The Cosmic Rays | year released
-        The relevant n-grams are lead single (first single, main track released, promotional single) | album 'Echoes of Tomorrow' (Echoes of Tomorrow LP, record Echoes of Tomorrow, the Echoes of Tomorrow album) | The Cosmic Rays (Cosmic Rays band, group The Cosmic Rays) | year released (release date, album year, publication year)
+            **Formatting rules:**
+            - Each candidate object must appear on its own line, beginning with `Id:`  
+            - When listing your chosen IDs, separate them with commas (e.g. `id1,id2,id3`; spaces are allowed but must be consistent)  
+            - Close your response with the terminator `<>` on its own line  
 
-        Here are the objects that can be relevant to answer the user query:
-        Id: 'Echoes of Tomorrow_sentence_0' Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
-        Id: 'Echoes of Tomorrow_table_0' Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
-        Id: 'The Cosmic Rays_sentence_0' The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
-        Id: 'Starlight Serenade_sentence_0' Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
-        Id: 'Celestial Journey_table_0' Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
-        Id: 'Music Reviews_sentence_0' Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
-        Id: 'The Cosmic Rays_table_0' The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
-        Id: 'Echoes of Tomorrow_sentence_1' Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
+            **Few-shot example:**
 
-        From the above objects, here are the IDs of those that are enough to answer the query:
-        Echoes of Tomorrow_sentence_0, Echoes of Tomorrow_table_0
-        <>
+            User question: What was the lead single from the album 'Echoes of Tomorrow' by The Cosmic Rays, and in what year was this album released?  
+            The relevant keywords are:  
+            lead single | album 'Echoes of Tomorrow' | The Cosmic Rays | year released
 
-        User question: {user_query}
-        The relevant keywords are: """)
-     
-    
+            Here are the objects that can be relevant to answer the user query:
+            Id: 'Echoes of Tomorrow_sentence_0' : Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
+            Id: 'Echoes of Tomorrow_table_0' : Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
+            Id: 'The Cosmic Rays_sentence_0' : The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
+            Id: 'Starlight Serenade_sentence_0' : Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
+            Id: 'Celestial Journey_table_0' : Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
+            Id: 'Music Reviews_sentence_0' : Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
+            Id: 'The Cosmic Rays_table_0' : The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
+            Id: 'Echoes of Tomorrow_sentence_1' : Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
+
+            From the above objects, here are the IDs of those that are enough to answer the query:
+            Echoes of Tomorrow_sentence_0,Echoes of Tomorrow_table_0
+            <>
+
+            **Now it’s your turn.**
+
+            User question: {user_query}  
+            The relevant keywords are:  
+            {keywords_string}
+
+            Here are the objects that can be relevant to answer the user query:
+            {serialized_objects}
+
+            From the above objects, here are the IDs of those that are enough to answer the query:
+            """)
+        
     def _get_keyword_generation_prompt_vllm(self, user_query: str) -> str:
         return textwrap.dedent(f"""
             From the following user question, extract the most important keywords or keyphrases.
@@ -328,7 +336,7 @@ class ARMRetriever(BaseRetriever):
             The relevant keywords are:""")
     
     
-    def rewrite_keyword(self, keyword: str, num_beams: int = 1, max_new_tokens: int = 30,length_penalty: float = 0.0,repetition_penalty: float = 1.0):
+    def rewrite_keyword(self, keyword: str, num_beams: int = 1, max_new_tokens: int = 30,repetition_penalty: float = 1.0):
         messages = [
             {"role": "system", "content": f"You are an expert assistant. Your task is to rewrite the user's keyword. The rewritten keyword must be one of the allowed phrases (n-grams of 1 to 4 words from a document). **If the original keyword itself is an allowed phrase, please use it directly.** Otherwise, use the shortest, most relevant allowed phrase. Enclose the chosen phrase strictly with {self.soi_token_str} and {self.eoi_token_str} tokens. Example: {self.soi_token_str}an example phrase{self.eoi_token_str}"},
             {"role": "user", "content": f"Rewrite the keyword '{keyword}' using only an allowed phrase from the document."}
@@ -347,10 +355,8 @@ class ARMRetriever(BaseRetriever):
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 num_return_sequences=num_beams,
-                early_stopping=True, 
                 eos_token_id=self.ngram_llm_tokenizer.eoi_token_id, 
                 pad_token_id=self.ngram_llm_tokenizer.pad_token_id,
-                length_penalty=length_penalty,
                 repetition_penalty=repetition_penalty,
                 do_sample=True,
                 temperature=1.0,
@@ -379,9 +385,12 @@ class ARMRetriever(BaseRetriever):
     
     
     def _perform_arm_retrieval_for_query(self, user_query: str):        
+        total_start_time = time.time()
+        
+        # Step 1: Keyword Generation
+        step1_start = time.time()
         all_vllm_keywords_set = set()
         keywords_for_rec_lm: List[str] = []
-        # 1. Keyword Generation using vLLM with beam search (n=5)
         if self.vllm_engine:
             keyword_prompt = self._get_keyword_generation_prompt_vllm(user_query)
             
@@ -394,36 +403,34 @@ class ARMRetriever(BaseRetriever):
             
             vllm_request_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params)
             
-            for beam_completion_output in vllm_request_outputs[0].outputs: # Iterate through each beam's output
+            for beam_completion_output in vllm_request_outputs[0].outputs:
                 generated_keywords_text = beam_completion_output.text.strip()
                 for stop_seq in keyword_sampling_params.stop:
                     if stop_seq in generated_keywords_text:
                         generated_keywords_text = generated_keywords_text.split(stop_seq, 1)[0].strip()
-                #lowercase the generated keywords text
                 generated_keywords_text = generated_keywords_text.lower()
                 beam_keywords = [k.strip() for k in generated_keywords_text.split('|') if k.strip()]
                 all_vllm_keywords_set.update(beam_keywords)
             
             keywords_for_rec_lm = list(all_vllm_keywords_set)
-            print(f"vLLM Generated Keywords (deduplicated from 5 beams): {keywords_for_rec_lm}")
         else:
             print("Warning: vLLM engine not initialized. Using full query as a keyword.")
             keywords_for_rec_lm = [user_query] if user_query.strip() else []
 
         keywords_for_rec_lm = [kw for kw in keywords_for_rec_lm if kw] 
-
-        # 2. N-gram Generation using RecLM-cgen (HF Transformers) for each deduplicated keyword
+        # Step 2: N-gram Generation
         all_final_ngrams_for_retrieval_temp: List[str] = []
         if self.generate_n_grams:
             for keyword_text in keywords_for_rec_lm:
-                extracted_items, _ = self.rewrite_keyword( # Ignoring extracted_raw as per original
+                extracted_items, _ = self.rewrite_keyword(
                     keyword_text,
                     num_beams=self.keyword_rephrasing_beams,
                 )
                 all_final_ngrams_for_retrieval_temp.extend(extracted_items)
         else: 
             all_final_ngrams_for_retrieval_temp = [kw for kw in keywords_for_rec_lm if kw]
-
+            
+        # Step 3: N-gram Processing
         processed_sub_ngrams: List[str] = []
         for phrase in all_final_ngrams_for_retrieval_temp:
             tokens = word_tokenize(phrase.lower())
@@ -435,43 +442,253 @@ class ARMRetriever(BaseRetriever):
             for ngram in generate_ngrams(filtered_tokens, self.corpus_ngram_min_len, self.corpus_ngram_max_len):
                 processed_sub_ngrams.append(" ".join(ngram))
         
+        # Step 4: Top N-gram Selection
         final_top_ngrams_for_retrieval: List[str] = []
         if processed_sub_ngrams:
             ngram_counts = Counter(processed_sub_ngrams)
-            # Sort n-grams by frequency in descending order
             sorted_ngrams_with_counts = sorted(ngram_counts.items(), key=lambda item: item[1], reverse=True)
             
-            # Separate candidates by count > 1 and count == 1
             gt1_candidates = [(ng, count) for ng, count in sorted_ngrams_with_counts if count > 1]
             eq1_candidates = [ng for ng, count in sorted_ngrams_with_counts if count == 1]
 
             last_added_count = -1
-            # Add n-grams with count > 1, keeping all ties for the last added count
             for ngram, count in gt1_candidates:
                 if len(final_top_ngrams_for_retrieval) < self.keywords_per_query:
                     final_top_ngrams_for_retrieval.append(ngram)
                     last_added_count = count
-                elif count == last_added_count: # Tie with count > 1
+                elif count == last_added_count:
                     final_top_ngrams_for_retrieval.append(ngram)
                 else: 
                     break 
             
             if len(final_top_ngrams_for_retrieval) < self.keywords_per_query:
                 needed = self.keywords_per_query - len(final_top_ngrams_for_retrieval)
-                random.shuffle(eq1_candidates) # Shuffle for random selection
+                random.shuffle(eq1_candidates)
                 final_top_ngrams_for_retrieval.extend(eq1_candidates[:needed])
         else:
             print("Warning: No sub-ngrams generated after stopword removal and tokenization steps.")
 
         self.current_keywords = keywords_for_rec_lm
         self.current_ngrams_for_retrieval = final_top_ngrams_for_retrieval + self.current_keywords
+
+        # Step 5: Initial Retrieval (BM25 + FAISS)
+        retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
+        retrieved_docs_by_bm25_nested = self.bm25_retriever.retrieve(
+            nlqs=self.current_ngrams_for_retrieval,
+            output_folder=self.bm25_index_path, 
+            k=self.alignment_retrieval_k
+        )
+        retrieved_docs_by_faiss: List[List[RetrievalResult]] = []
+        retrieved_docs_by_faiss = self.faiss_dense_retriever.retrieve(
+            nlqs=[user_query], 
+            output_folder=self.faiss_index_path, 
+            k=self.alignment_retrieval_k 
+        )
+        all_bm25_results_flat: List[RetrievalResult] = [item for sublist in retrieved_docs_by_bm25_nested for item in sublist]
+        faiss_results_for_query: List[RetrievalResult] = retrieved_docs_by_faiss[0] if retrieved_docs_by_faiss else []
+        combined_initial_candidates = all_bm25_results_flat + faiss_results_for_query
+
+        # Step 6: Deduplication
+        step6_start = time.time()
+        unique_retrieved_objects_map = {}
+        for res_item in combined_initial_candidates:
+            current_meta = res_item.metadata if isinstance(res_item.metadata, dict) else {}
+            doc_id = res_item.object
+            if doc_id not in unique_retrieved_objects_map:
+                unique_retrieved_objects_map[doc_id] = {'doc': res_item, 'max_score': res_item.score, 'metadata': current_meta}
+            else:
+                unique_retrieved_objects_map[doc_id]['max_score'] = max(
+                    unique_retrieved_objects_map[doc_id]['max_score'], res_item.score
+                )
+
+        # Step 7: Global Relevance Scoring
+        query_embedding_tensor = self.embedding_model.encode(user_query, convert_to_tensor=True, show_progress_bar=False)
+        query_embedding_tensor = query_embedding_tensor.to(self.device)
+        if query_embedding_tensor.ndim == 1: query_embedding_tensor = query_embedding_tensor.unsqueeze(0)
+        texts_for_global_Ri_calc = set()
+        for data_item in unique_retrieved_objects_map.values():
+            texts_for_global_Ri_calc.add(data_item['doc'].object)
+        unique_texts_list_for_global_Ri = list(texts_for_global_Ri_calc)
+        global_relevance_scores_map: Dict[str, float] = {}
+        texts_needing_fresh_encoding_for_global_Ri = []
+        if self.faiss_index and self.faiss_text_to_idx_map and self.faiss_index.ntotal > 0:
+            candidate_faiss_indices_global = []
+            map_faiss_idx_to_text_global = {}
+            for text_content in unique_texts_list_for_global_Ri:
+                if text_content in self.faiss_text_to_idx_map:
+                    original_faiss_idx = self.faiss_text_to_idx_map[text_content]
+                    if 0 <= original_faiss_idx < self.faiss_index.ntotal:
+                        candidate_faiss_indices_global.append(original_faiss_idx)
+                        map_faiss_idx_to_text_global[original_faiss_idx] = text_content
+                    else:
+                        texts_needing_fresh_encoding_for_global_Ri.append(text_content)
+                else:
+                    texts_needing_fresh_encoding_for_global_Ri.append(text_content)
+            if candidate_faiss_indices_global:
+                reconstructed_embs_np_global = np.array([self.faiss_index.reconstruct(idx) for idx in candidate_faiss_indices_global]).astype('float32')
+                reconstructed_embs_tensor_global = torch.tensor(reconstructed_embs_np_global).to(self.device)
+                if query_embedding_tensor.nelement() > 0 and reconstructed_embs_tensor_global.nelement() > 0:
+                    sim_scores_tensor_global = util.cos_sim(query_embedding_tensor, reconstructed_embs_tensor_global)[0]
+                    for i, original_faiss_idx in enumerate(candidate_faiss_indices_global):
+                        obj_text = map_faiss_idx_to_text_global[original_faiss_idx]
+                        score = (sim_scores_tensor_global[i].item() + 1) / 2.0
+                        global_relevance_scores_map[obj_text] = score
+        else:
+            texts_needing_fresh_encoding_for_global_Ri.extend(unique_texts_list_for_global_Ri)
+
+        unique_texts_needing_fresh_Ri = list(set(texts_needing_fresh_encoding_for_global_Ri))
+        if unique_texts_needing_fresh_Ri:
+            obj_embeddings_tensor_global = self.embedding_model.encode(
+                unique_texts_needing_fresh_Ri, convert_to_tensor=True, show_progress_bar=False, batch_size=128
+            )
+            obj_embeddings_tensor_global = obj_embeddings_tensor_global.to(self.device)
+
+            if query_embedding_tensor.nelement() > 0 and obj_embeddings_tensor_global.nelement() > 0:
+                sim_scores_tensor_global_fresh = util.cos_sim(query_embedding_tensor, obj_embeddings_tensor_global)[0]
+                for i, text_content in enumerate(unique_texts_needing_fresh_Ri):
+                    score = (sim_scores_tensor_global_fresh[i].item() + 1) / 2.0
+                    global_relevance_scores_map[text_content] = score
+
+        # Step 8: MIP Input Preparation
+        initial_mip_input_candidates = []
+        for doc_id, data_item in unique_retrieved_objects_map.items():
+            doc_object_text = data_item['doc'].object
+            relevance_score_R_i = global_relevance_scores_map.get(doc_object_text, 0.0)
+
+            current_metadata = data_item['metadata']
+            source_str = current_metadata.get('source', 'unknown_source')
+            source_type = 'table' if 'table' in source_str.lower() else 'passage'
+            parsed_content_val = None
+            if source_type == 'table':
+                parsed_content_val = self.mip_solver._parse_table_object_string(doc_object_text)
+
+            initial_mip_input_candidates.append({
+                'id': doc_id,
+                'text': doc_object_text,
+                'source_type': source_type,
+                'parsed_content': parsed_content_val,
+                'relevance_score_R_i': relevance_score_R_i,
+                'metadata': current_metadata
+            })
         
-        print(f"Selected Keywords (displaying first {len(self.current_keywords)} of {len(keywords_for_rec_lm)} unique vLLM keywords): {self.current_keywords}")
-        print(f"Final N-grams for retrieval (Top up to {len(self.current_ngrams_for_retrieval)}): {self.current_ngrams_for_retrieval}")
-        print(f"--- Keyword and N-gram Generation Complete for query '{user_query}' ---")
-        return
+        # Step 9: Expansion
+        expanded_candidates_dict = {obj['id']: obj for obj in initial_mip_input_candidates}
+        if self.expansion_steps > 0:
+            current_candidates_to_expand_from = list(initial_mip_input_candidates)
+            for step in range(self.expansion_steps):
+                newly_added_in_this_step_list = []
+                expansion_queries = [base_obj['text'] for base_obj in current_candidates_to_expand_from if base_obj['text']]
+
+                bm25_expansion_results_nested = self.bm25_retriever.retrieve(
+                    nlqs=expansion_queries,
+                    output_folder=self.bm25_index_path,
+                    k=self.expansion_k_compatible
+                )
+
+                for i, base_obj_text_queried in enumerate(expansion_queries):
+                    bm25_retrieved_for_this_base_obj = bm25_expansion_results_nested[i]
+                    
+                    for bm25_res_item in bm25_retrieved_for_this_base_obj:
+                        expanded_content_as_key = bm25_res_item.object 
+
+                        if expanded_content_as_key not in expanded_candidates_dict:
+                            expanded_relevance_score_R_i = 0.0
+                            if expanded_content_as_key in global_relevance_scores_map:
+                                expanded_relevance_score_R_i = global_relevance_scores_map[expanded_content_as_key]
+                            else:
+                                if query_embedding_tensor.nelement() > 0:
+                                    expanded_item_emb_np = self.faiss_dense_retriever.faiss_encode(
+                                        [expanded_content_as_key], 
+                                        self.faiss_index_path 
+                                    )
+                                    expanded_item_emb = torch.tensor(expanded_item_emb_np).to(self.device)
+                                    if expanded_item_emb.ndim == 1: expanded_item_emb = expanded_item_emb.unsqueeze(0)
+                                    if expanded_item_emb.nelement() > 0:
+                                        sim_score = util.cos_sim(query_embedding_tensor, expanded_item_emb).item()
+                                        expanded_relevance_score_R_i = (sim_score + 1) / 2.0
+                                global_relevance_scores_map[expanded_content_as_key] = expanded_relevance_score_R_i
+
+                            temp_meta = bm25_res_item.metadata if isinstance(bm25_res_item.metadata, dict) else {}
+                            temp_source_str = temp_meta.get('source', 'unknown_source_bm25_expanded')
+                            temp_source_type = 'table' if 'table' in temp_source_str.lower() else 'passage'
+                            temp_parsed_content = None
+                            if temp_source_type == 'table':
+                                temp_parsed_content = self.mip_solver._parse_table_object_string(expanded_content_as_key)
+
+                            mip_formatted_new_candidate = {
+                                'id': expanded_content_as_key,
+                                'text': expanded_content_as_key,
+                                'source_type': temp_source_type,
+                                'parsed_content': temp_parsed_content,
+                                'relevance_score_R_i': expanded_relevance_score_R_i,
+                                'metadata': temp_meta
+                            }
+                            expanded_candidates_dict[expanded_content_as_key] = mip_formatted_new_candidate
+                            newly_added_in_this_step_list.append(mip_formatted_new_candidate)
+                
+                if not newly_added_in_this_step_list:
+                    break
+                current_candidates_to_expand_from = newly_added_in_this_step_list
+        final_mip_candidates = list(expanded_candidates_dict.values())
+
+        # Step 10: MIP Solving
+        selected_objects_by_mip = []
+        if final_mip_candidates:
+            selected_objects_by_mip = self.mip_solver._solve_mip_object_selection(
+                candidate_objects=final_mip_candidates,
+                k_select=self.mip_k_select
+            )
+        
+        object_ids_for_llm_selection = []
+        mip_objects_map_for_final_selection = {} 
+        serialized_objects = str()
+        for idx, obj_data_item in enumerate(selected_objects_by_mip):
+            meta = obj_data_item.get('metadata', {})
+            page_title = meta.get('page_title', f"untitled_{obj_data_item['id']}") # Use obj_data_item['id'] for more uniqueness
+            source_info = meta.get('source', f"unknownsrc_{obj_data_item['id']}")
+            object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_").replace("/", "_") # Sanitize more
+
+            object_ids_for_llm_selection.append(object_llm_id)
+            mip_objects_map_for_final_selection[object_llm_id] = obj_data_item
+
+            serialized_objects += f"Id: '{object_llm_id}' : {obj_data_item['text']}\n"
+            
+        serialized_keywords = " | ".join(self.current_keywords)
+        selection_prompt = self._get_final_selection_prompt(
+            user_query=user_query,
+            keywords_string=serialized_keywords,
+            serialized_objects=serialized_objects
+        )
+        start_selection_time = time.time()
+        selection_sampling_params = VLLM_SamplingParams(
+            temperature=0.0,          # deterministic
+            max_tokens=150,
+            stop=["<>"],              # stop when the terminator is emitted
+        )
+        vllm_outputs = self.vllm_engine.generate([selection_prompt], selection_sampling_params,use_tqdm=False)
+        raw_llm_output = vllm_outputs[0].outputs[0].text
+        llm_selected_string_ids = self.parse_selected_ids(raw_llm_output) # These are string IDs like "page_title_source_info"
+        end_selection_time = time.time()
+        selection_time_elapsed = end_selection_time - start_selection_time # This variable is calculated but not used later; can be kept or removed.
+
+        final_selected_objects_list = []
+        for llm_id_str in llm_selected_string_ids:
+            if llm_id_str in mip_objects_map_for_final_selection:
+                final_selected_objects_list.append(mip_objects_map_for_final_selection[llm_id_str])
+            else:
+                print(f"Warning: LLM-selected ID '{llm_id_str}' not found in the candidate map. Skipping this ID.")
+        
+        return final_selected_objects_list
     
-        
+    @staticmethod
+    def parse_selected_ids(raw_output: str) -> List[str]:
+        # Remove the terminator, newlines & whitespace
+        cleaned = raw_output.replace("<>", "").strip()
+        # If the model ever writes the heading, drop everything before the first newline
+        if "\n" in cleaned:
+            cleaned = cleaned.split("\n")[-1].strip()
+        # Split on commas and strip whitespace
+        return [id_.strip() for id_ in cleaned.split(",") if id_.strip()]
 """
 if __name__ == "__main__":
     
@@ -509,7 +726,7 @@ if __name__ == "__main__":
                 )
                 print(f"Results: {results}")
 
-"""
+
 
 if __name__ == "__main__":
     arm = ARMRetriever(
@@ -517,13 +734,8 @@ if __name__ == "__main__":
         faiss_index_path = "assets/feverous/faiss_indexes/dense_row_UAE-Large-V1",
         bm25_index_path ="assets/feverous/pyserini_indexes/bm25_row_index",
         ngram_llm_model_path="meta-llama/Meta-Llama-3-8B-Instruct",
-        keyword_alignment=False,
         generate_n_grams=True,
-        constrained_id_generation=False,
-        mip_k_select=10,
-        expansion_k_compatible=0,
-        expansion_steps=1,
-        keyword_rephrasing_beams=10,
+        mip_k_select=30,
         vllm_tensor_parallel_size = 1
     )
     
@@ -546,3 +758,5 @@ if __name__ == "__main__":
         k=5
     )
     print(f"Results: {results}")
+    
+"""

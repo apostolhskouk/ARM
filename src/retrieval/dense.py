@@ -117,7 +117,6 @@ class FaissDenseRetriever(BaseRetriever):
             try:
                 res = faiss.StandardGpuResources()
                 index_to_search = faiss.index_cpu_to_gpu(res, 0, index_cpu)
-                print("Using FAISS GPU index.")
             except Exception as e:
                 print(f"GPU move failed ({e}), using CPU index.")
                 # No need to assign index_to_search = index_cpu again, it's the default
