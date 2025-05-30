@@ -1,28 +1,24 @@
-import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../external/RecAI/RecLM-cgen")))
 import pickle
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Optional, Set
 from tqdm import tqdm
-import numpy as np
 import torch
 import faiss
-from sentence_transformers import SentenceTransformer, util
-from pulp import LpProblem, LpVariable, lpSum, LpMaximize, LpBinary, PULP_CBC_CMD, GUROBI_CMD
-from pulp.apis.core import PulpSolverError
-import re
+from sentence_transformers import SentenceTransformer
 import textwrap
-import time
 from src.retrieval.base import BaseRetriever, RetrievalResult
 from src.retrieval.bm25 import PyseriniBM25Retriever
 from src.retrieval.dense import FaissDenseRetriever
-from itertools import combinations
-from train_utils.processor import FastPrefixConstrainedLogitsProcessor, Trie_link
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from train_utils.utils import get_ctrl_item 
 from vllm import LLM as VLLM_Engine, SamplingParams as VLLM_SamplingParams
 import json 
-
+from src.utils.recai_recommender import Trie_link, FastPrefixConstrainedLogitsProcessor
+from src.utils.text_precessor import simple_tokenize, generate_ngrams
+from nltk.tokenize import word_tokenize 
+import random
+from collections import Counter
+from nltk.corpus import stopwords
+from src.utils.mip_solver import MIPSolver
 
 class ARMRetriever(BaseRetriever):
     FAISS_INDEX_FILENAME = "index.faiss"
@@ -52,7 +48,9 @@ class ARMRetriever(BaseRetriever):
                 vllm_tensor_parallel_size: int = 2,
                 vllm_cache_dir: str = "/data/hdd1/vllm_models/",
                 vllm_quantization: Optional[str] = None,
-                filter_ngrams_against_corpus: bool = True
+                filter_ngrams_against_corpus: bool = True,
+                arm_cache_dir: str = "assets/arm/",
+                keywords_per_query: int = 10
                 ) -> None:
 
         self.faiss_index_path = faiss_index_path
@@ -65,7 +63,7 @@ class ARMRetriever(BaseRetriever):
         self.corpus_ngram_min_len = corpus_ngram_min_len # Renamed
         self.corpus_ngram_max_len = corpus_ngram_max_len
         self.indexed_field: Optional[str] = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
         self.embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
@@ -100,11 +98,20 @@ class ARMRetriever(BaseRetriever):
         
         self.valid_corpus_ngrams_set: Set[str] = set() # New: For storing word-based corpus n-grams
         self.filter_ngrams_against_corpus = filter_ngrams_against_corpus # New
-        
-        
+        self.arm_cache_dir = arm_cache_dir
+        self.stop_words_set = set(stopwords.words('english'))
+        self.keywords_per_query = keywords_per_query
         if self.vllm_model_path:
             self._initialize_vllm()
-            
+        self.mip_solver = MIPSolver(
+            embedding_model=self.embedding_model,
+            faiss_dense_retriever=self.faiss_dense_retriever,
+            faiss_index_path=self.faiss_index_path,
+            device=self.device,
+            compatibility_semantic_weight=self.compatibility_semantic_weight,
+            compatibility_exact_weight=self.compatibility_exact_weight
+        )
+        
     def _initialize_vllm(self): 
         tokenizer = AutoTokenizer.from_pretrained(self.vllm_model_path, trust_remote_code=True, cache_dir=self.vllm_cache_dir)
         if tokenizer.pad_token is None:
@@ -116,84 +123,89 @@ class ARMRetriever(BaseRetriever):
                 tokenizer=tokenizer.name_or_path,
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
-                gpu_memory_utilization=0.5, 
+                gpu_memory_utilization=0.8, 
+                max_model_len=2048,
             )
             print("vLLM engine initialized.")
         else:
             print("vLLM model path not provided. Skipping vLLM initialization.")
             
-    def simple_tokenize(self,text):
-        """Simple tokenizer that splits on words/punctuation, removes [SEP], and lowercases."""
-        tokens = re.findall(r'\w+|[^\w\s]', text, re.UNICODE)
-        tokens = [token for token in tokens if token != '[SEP]']
-        return [token.lower() for token in tokens if token.strip()]
-
-    def generate_ngrams(self,tokens, min_n, max_n):
-        """Generates n-grams from a list of tokens."""
-        num_tokens = len(tokens)
-        for n in range(min_n, max_n + 1):
-            for i in range(num_tokens - n + 1):
-                yield tuple(tokens[i:i+n])
             
-    def _extract_corpus_word_ngrams_from_file(self, input_jsonl_path: str, field_to_index: str) -> List[str]:
-        unique_ngram_strings = set()
-        processed_lines = 0
-        total_lines = 0 
-        with open(input_jsonl_path, 'r', encoding='utf-8') as f_count:
-            total_lines = sum(1 for _ in f_count)
-        with open(input_jsonl_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, total=total_lines if total_lines > 0 else None, desc="Processing JSONL lines"):
-                processed_lines += 1
-                line = line.strip() 
-                if not line: continue
-                data = json.loads(line)
-                serialization_text = data.get(field_to_index)
-                tokens = self.simple_tokenize(serialization_text)
-                if tokens:
-                    for ngram_tuple in self.generate_ngrams(tokens, self.corpus_ngram_min_len, self.corpus_ngram_max_len):
-                        ngram_string = " ".join(ngram_tuple)
-                        unique_ngram_strings.add(ngram_string)
-                        
-        return list(unique_ngram_strings)
                         
     def _initialize_ngram_llm_and_build_trie(self, input_jsonl_path_for_ngrams: str, field_for_ngrams: str):
         if not self.ngram_llm_model_path: return
-        self.ngram_llm_tokenizer = AutoTokenizer.from_pretrained(self.ngram_llm_tokenizer_path)
-        self.ngram_llm_model = AutoModelForCausalLM.from_pretrained(self.ngram_llm_model_path)
-        tokens_to_add = ['<SOI>', '<EOI>']
-        if self.ngram_llm_tokenizer.pad_token is None:
-            # Add [PAD] token if tokenizer doesn't have one (like gpt2)
-            tokens_to_add.append('[PAD]')
+        self.ngram_llm_tokenizer = AutoTokenizer.from_pretrained(self.ngram_llm_tokenizer_path,cache_dir=self.vllm_cache_dir, trust_remote_code=True)
+        self.ngram_llm_model = AutoModelForCausalLM.from_pretrained(self.ngram_llm_model_path,torch_dtype=torch.bfloat16,cache_dir=self.vllm_cache_dir, trust_remote_code=True).to(self.device)
+        self.ngram_llm_model.eval()
 
-        self.ngram_llm_tokenizer.add_special_tokens({'additional_special_tokens': tokens_to_add})
+        self.soi_token_str: str = "<GROUND_SOI>" 
+        self.eoi_token_str: str = "<GROUND_EOI>"
+        
+        special_tokens_dict = {'additional_special_tokens': [self.soi_token_str, self.eoi_token_str]}
+        num_added_toks = self.ngram_llm_tokenizer.add_special_tokens(special_tokens_dict)
+        
+        if num_added_toks > 0:
+            self.ngram_llm_model.resize_token_embeddings(len(self.ngram_llm_tokenizer))
 
-        if self.ngram_llm_tokenizer.pad_token_id is None: # If [PAD] was just added and not set as pad_token
-            self.ngram_llm_tokenizer.pad_token = '[PAD]'
-            self.ngram_llm_tokenizer.pad_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids('[PAD]')
-
-        self.ngram_llm_tokenizer.soi_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids('<SOI>')
-        self.ngram_llm_tokenizer.eoi_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids('<EOI>')
-        self.ngram_llm_model.resize_token_embeddings(len(self.ngram_llm_tokenizer))
-
-        self.ngram_llm_model.to(self.device)
-        self.ngram_llm_model.eval() # Set model to evaluation mode
-        corpus_word_ngrams_list = self._extract_corpus_word_ngrams_from_file(input_jsonl_path_for_ngrams, field_for_ngrams)
-        #check if 'yepiskoposan' exists in list
-        if 'yepiskoposan' in corpus_word_ngrams_list:
-            print("'yepiskoposan' found in corpus word n-grams.")
-        else:
-            print("'yepiskoposan' not found in corpus word n-grams.")
-        #check for yepiskoposyan 
-        if 'yepiskoposyan' in corpus_word_ngrams_list:
-            print("'yepiskoposyan' found in corpus word n-grams.")
-        else:
-            print("'yepiskoposyan' not found in corpus word n-grams.")
-        item_ids_list = self.ngram_llm_tokenizer.batch_encode_plus(corpus_word_ngrams_list, add_special_tokens=False).input_ids
-        item_prefix_tree = Trie_link(item_ids_list, self.ngram_llm_tokenizer)
-        self.ngram_corpus_logits_processor = FastPrefixConstrainedLogitsProcessor(
-            prefix_allowed_tokens_fn=item_prefix_tree.constrain_search_list, 
-            num_beams=self.keyword_rephrasing_beams
+        self.ngram_llm_tokenizer.soi_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids(self.soi_token_str)
+        self.ngram_llm_tokenizer.eoi_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids(self.eoi_token_str)
+        
+        if self.ngram_llm_tokenizer.pad_token_id is None:
+            if self.ngram_llm_tokenizer.eos_token_id is not None:
+                self.ngram_llm_tokenizer.pad_token_id = self.ngram_llm_tokenizer.eos_token_id
+            else:
+                self.ngram_llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+                self.ngram_llm_model.resize_token_embeddings(len(self.ngram_llm_tokenizer))
+                self.ngram_llm_tokenizer.pad_token_id = self.ngram_llm_tokenizer.convert_tokens_to_ids('[PAD]')
+        os.makedirs(self.arm_cache_dir, exist_ok=True) 
+        sanitized_input_basename = os.path.basename(input_jsonl_path_for_ngrams).replace('.', '_').replace(os.sep, '_')
+        cache_filename = f"trie_cache_{sanitized_input_basename}_min{self.corpus_ngram_min_len}_max{self.corpus_ngram_max_len}.pkl"
+        cache_filepath = os.path.join(self.arm_cache_dir, cache_filename)
+        if os.path.exists(cache_filepath): 
+            print(f"Loading trie from cache: {cache_filepath}") 
+            with open(cache_filepath, 'rb') as f: 
+                self.item_prefix_trie = pickle.load(f) 
+            self.item_prefix_trie.tokenizer = self.ngram_llm_tokenizer 
+            self.logits_processor_instance = FastPrefixConstrainedLogitsProcessor( 
+                self.item_prefix_trie.constrain_search_list, 
+                num_beams=self.keyword_rephrasing_beams 
+            ) 
+            print("Trie and logits processor loaded from cache.") 
+            return
+        
+        with open(input_jsonl_path_for_ngrams, 'r', encoding='utf-8') as f:
+            data_from_json = [json.loads(line) for line in f if line.strip()]
+        
+        text_content = ""
+        all_text_parts = [] #
+        if isinstance(data_from_json, dict): 
+            all_text_parts.append(data_from_json.get(field_for_ngrams, "")) 
+        elif isinstance(data_from_json, list): 
+            for item_in_list in data_from_json: 
+                if isinstance(item_in_list, dict) and field_for_ngrams in item_in_list: 
+                    all_text_parts.append(str(item_in_list[field_for_ngrams])) 
+        text_content = " ".join(all_text_parts) 
+                    
+        word_tokens = simple_tokenize(text_content)
+        self.ngrams_strings = set()
+        for ngram_tuple in generate_ngrams(word_tokens, self.corpus_ngram_min_len, self.corpus_ngram_max_len): 
+            self.ngrams_strings.add(" ".join(ngram_tuple))
+        self.ngram_token_ids_for_trie_build: List[List[int]] = []
+        for ngram_str_item in self.ngrams_strings:
+            token_ids = self.ngram_llm_tokenizer.encode(ngram_str_item, add_special_tokens=False)
+            if token_ids: 
+                 self.ngram_token_ids_for_trie_build.append(token_ids)
+                 
+        self.item_prefix_trie = Trie_link(self.ngram_token_ids_for_trie_build, self.ngram_llm_tokenizer)      
+        self.logits_processor_instance = FastPrefixConstrainedLogitsProcessor(
+            self.item_prefix_trie.constrain_search_list,
+            num_beams=self.keyword_rephrasing_beams 
         )
+
+        with open(cache_filepath, 'wb') as f: 
+            pickle.dump(self.item_prefix_trie, f) 
+        print(f"Trie saved to cache: {cache_filepath}") 
+        
 
     def _load_faiss_assets(self, faiss_folder_path: str) -> bool:
         index_file = os.path.join(faiss_folder_path, self.FAISS_INDEX_FILENAME)
@@ -269,377 +281,6 @@ class ARMRetriever(BaseRetriever):
 
         return all_query_results
 
-    @staticmethod
-    def _parse_table_object_string(table_str: str) -> dict:
-        parts = table_str.split(" [SEP] ", 1)
-        table_name = parts[0]
-        columns_data = {}
-        if len(parts) > 1 and parts[1]:
-            content_part = parts[1].strip()
-            if content_part.startswith("[H] "):
-                current_attributes_str = content_part[4:]
-            else:
-                current_attributes_str = content_part
-            attributes = current_attributes_str.split(" , [H] ")
-            for attr_str in attributes:
-                header_content_split = attr_str.split(":", 1)
-                if len(header_content_split) == 2:
-                    header, content = header_content_split[0].strip(), header_content_split[1].strip()
-                    if header not in columns_data:
-                        columns_data[header] = []
-                    columns_data[header].append(content)
-        return {"name": table_name, "columns": columns_data}
-
-    @staticmethod
-    def _get_tokens_cached(text: str, cache: Dict[str, Set[str]]) -> Set[str]:
-        if text in cache:
-            return cache[text]
-        processed_text = text.lower()
-        processed_text = re.sub(r'[^\w\s]', '', processed_text)
-        tokens = set(processed_text.split())
-        cache[text] = tokens
-        return tokens
-
-    def _get_tokens(self, text: str) -> Set[str]:
-        return ARMRetriever._get_tokens_cached(text, {})
-
-    @staticmethod
-    def _jaccard_similarity(set1: Set[str], set2: Set[str]) -> float:
-        if not set1 and not set2: return 1.0
-        if not set1 or not set2: return 0.0
-        intersection = len(set1.intersection(set2))
-        union = len(set1.union(set2))
-        return intersection / union if union > 0 else 0.0
-
-    @staticmethod
-    def _overlap_coefficient(set1: Set[str], set2: Set[str]) -> float:
-        if not set1 and not set2: return 1.0
-        if not set1 or not set2: return 0.0
-        intersection = len(set1.intersection(set2))
-        min_len = min(len(set1), len(set2))
-        return intersection / min_len if min_len > 0 else 0.0
-
-    def _get_semantic_similarity_from_embeddings(self, emb1: Optional[torch.Tensor], emb2: Optional[torch.Tensor]) -> float:
-        if emb1 is None or emb2 is None:
-            return 0.0
-        
-        if isinstance(emb1, np.ndarray):
-            if emb1.size == 0: return 0.0
-            emb1_tensor = torch.tensor(emb1, dtype=torch.float32)
-        elif isinstance(emb1, torch.Tensor):
-            if emb1.nelement() == 0: return 0.0
-            emb1_tensor = emb1
-        else: 
-            return 0.0
-
-        if isinstance(emb2, np.ndarray):
-            if emb2.size == 0: return 0.0 
-            emb2_tensor = torch.tensor(emb2, dtype=torch.float32)
-        elif isinstance(emb2, torch.Tensor):
-            if emb2.nelement() == 0: return 0.0
-            emb2_tensor = emb2
-        else: 
-            return 0.0
-        
-        current_emb1 = emb1_tensor.to(self.device) if emb1_tensor.device != self.device else emb1_tensor
-        current_emb2 = emb2_tensor.to(self.device) if emb2_tensor.device != self.device else emb2_tensor
-
-        if current_emb1.ndim == 1: current_emb1 = current_emb1.unsqueeze(0)
-        if current_emb2.ndim == 1: current_emb2 = current_emb2.unsqueeze(0)
-        
-        return util.cos_sim(current_emb1, current_emb2).item()
-    
-    def _get_semantic_similarity(self, text1: str, text2: str) -> float:
-        emb1 = self.embedding_model.encode(text1, convert_to_tensor=True, show_progress_bar=False)
-        emb2 = self.embedding_model.encode(text2, convert_to_tensor=True, show_progress_bar=False)
-        return self._get_semantic_similarity_from_embeddings(emb1, emb2)
-    def _calculate_table_table_compatibility_optimized(
-        self, table1_parsed: dict, table2_parsed: dict, 
-        embeddings_map: Dict[str, torch.Tensor], tokens_cache: Dict[str, Set[str]]
-    ) -> float:
-        max_col_pair_compatibility = 0.0
-        table1_headers = list(table1_parsed["columns"].keys())
-        table2_headers = list(table2_parsed["columns"].keys())
-        if not table1_headers or not table2_headers: return 0.0
-
-        for h1 in table1_headers:
-            emb_h1 = embeddings_map.get(h1)
-            if emb_h1 is None: continue
-            for h2 in table2_headers:
-                emb_h2 = embeddings_map.get(h2)
-                if emb_h2 is None: continue
-
-                header_sem_sim = self._get_semantic_similarity_from_embeddings(emb_h1, emb_h2)
-                
-                col1_value_tokens = set()
-                for v_val in table1_parsed["columns"].get(h1, []): 
-                    col1_value_tokens.update(ARMRetriever._get_tokens_cached(v_val, tokens_cache))
-                col2_value_tokens = set()
-                for v_val in table2_parsed["columns"].get(h2, []): 
-                    col2_value_tokens.update(ARMRetriever._get_tokens_cached(v_val, tokens_cache))
-                
-                exact_val_sim = self._jaccard_similarity(col1_value_tokens, col2_value_tokens)
-                col_pair_comp = (self.compatibility_semantic_weight * header_sem_sim +
-                                 self.compatibility_exact_weight * exact_val_sim)
-                if col_pair_comp > max_col_pair_compatibility:
-                    max_col_pair_compatibility = col_pair_comp
-        return max_col_pair_compatibility
-
-    def _calculate_table_passage_compatibility_optimized(
-        self, table_parsed: dict, passage_text: str, passage_embedding: Optional[torch.Tensor], 
-        embeddings_map: Dict[str, torch.Tensor], tokens_cache: Dict[str, Set[str]]
-    ) -> float:
-        max_cell_sentence_compatibility = 0.0
-        if not table_parsed["columns"] or passage_embedding is None: return 0.0
-        
-        passage_tokens = ARMRetriever._get_tokens_cached(passage_text, tokens_cache)
-
-        for header, cells in table_parsed["columns"].items():
-            for cell_content in cells:
-                emb_cell = embeddings_map.get(cell_content)
-                if emb_cell is None: continue
-
-                cell_sem_sim = self._get_semantic_similarity_from_embeddings(emb_cell, passage_embedding)
-                
-                cell_tokens = ARMRetriever._get_tokens_cached(cell_content, tokens_cache)
-                exact_val_sim = self._overlap_coefficient(cell_tokens, passage_tokens)
-                cell_sentence_comp = (self.compatibility_semantic_weight * cell_sem_sim +
-                                      self.compatibility_exact_weight * exact_val_sim)
-                if cell_sentence_comp > max_cell_sentence_compatibility:
-                    max_cell_sentence_compatibility = cell_sentence_comp
-        return max_cell_sentence_compatibility
-
-    def _calculate_passage_passage_compatibility_optimized(
-        self, passage1_text: str, passage1_embedding: Optional[torch.Tensor], 
-        passage2_text: str, passage2_embedding: Optional[torch.Tensor],
-        tokens_cache: Dict[str, Set[str]]
-    ) -> float:
-        if passage1_embedding is None or passage2_embedding is None: return 0.0
-        
-        sem_sim = self._get_semantic_similarity_from_embeddings(passage1_embedding, passage2_embedding)
-        
-        passage1_tokens = ARMRetriever._get_tokens_cached(passage1_text, tokens_cache)
-        passage2_tokens = ARMRetriever._get_tokens_cached(passage2_text, tokens_cache)
-        
-        exact_val_sim = self._overlap_coefficient(passage1_tokens, passage2_tokens)
-        return (self.compatibility_semantic_weight * sem_sim +
-                self.compatibility_exact_weight * exact_val_sim)
-        
-        
-    def _calculate_table_table_compatibility(self, table1_parsed: dict, table2_parsed: dict) -> float:
-        max_col_pair_compatibility = 0.0
-        table1_headers = list(table1_parsed["columns"].keys())
-        table2_headers = list(table2_parsed["columns"].keys())
-        if not table1_headers or not table2_headers: return 0.0
-        for h1 in table1_headers:
-            for h2 in table2_headers:
-                header_sem_sim = self._get_semantic_similarity(h1, h2)
-                col1_value_tokens = set()
-                for v_val in table1_parsed["columns"].get(h1, []): col1_value_tokens.update(self._get_tokens(v_val))
-                col2_value_tokens = set()
-                for v_val in table2_parsed["columns"].get(h2, []): col2_value_tokens.update(self._get_tokens(v_val))
-                exact_val_sim = self._jaccard_similarity(col1_value_tokens, col2_value_tokens)
-                col_pair_comp = (self.compatibility_semantic_weight * header_sem_sim +
-                                 self.compatibility_exact_weight * exact_val_sim)
-                if col_pair_comp > max_col_pair_compatibility:
-                    max_col_pair_compatibility = col_pair_comp
-        return max_col_pair_compatibility
-
-    def _calculate_table_passage_compatibility(self, table_parsed: dict, passage_text: str) -> float:
-        max_cell_sentence_compatibility = 0.0
-        passage_tokens = self._get_tokens(passage_text)
-        if not table_parsed["columns"]: return 0.0
-        for header, cells in table_parsed["columns"].items():
-            for cell_content in cells:
-                cell_sem_sim = self._get_semantic_similarity(cell_content, passage_text)
-                cell_tokens = self._get_tokens(cell_content)
-                exact_val_sim = self._overlap_coefficient(cell_tokens, passage_tokens)
-                cell_sentence_comp = (self.compatibility_semantic_weight * cell_sem_sim +
-                                      self.compatibility_exact_weight * exact_val_sim)
-                if cell_sentence_comp > max_cell_sentence_compatibility:
-                    max_cell_sentence_compatibility = cell_sentence_comp
-        return max_cell_sentence_compatibility
-
-    def _calculate_passage_passage_compatibility(self, passage1_text: str, passage2_text: str) -> float:
-        sem_sim = self._get_semantic_similarity(passage1_text, passage2_text)
-        passage1_tokens = self._get_tokens(passage1_text)
-        passage2_tokens = self._get_tokens(passage2_text)
-        exact_val_sim = self._overlap_coefficient(passage1_tokens, passage2_tokens)
-        return (self.compatibility_semantic_weight * sem_sim +
-                self.compatibility_exact_weight * exact_val_sim)
-
-    def _solve_mip_object_selection(self, candidate_objects: list[dict], k_select: int) -> list[dict]:
-        num_objects = len(candidate_objects)
-        if num_objects == 0 or k_select <= 0: return []
-        
-        effective_k_select = min(k_select, num_objects)
-        
-        table_indices = [i for i, obj in enumerate(candidate_objects) if obj['source_type'] == 'table']
-        passage_indices = [i for i, obj in enumerate(candidate_objects) if obj['source_type'] == 'passage']
-        
-        min_tables_needed = 0
-        min_passages_needed = 0
-        if effective_k_select > 0:
-            num_available_tables = len(table_indices)
-            num_available_passages = len(passage_indices)
-            if num_available_tables + num_available_passages < effective_k_select:
-                 effective_k_select = num_available_tables + num_available_passages
-            ideal_tables = effective_k_select // 2
-            ideal_passages = effective_k_select - ideal_tables
-            min_tables_needed = min(ideal_tables, num_available_tables)
-            min_passages_needed = min(ideal_passages, num_available_passages)
-            if min_tables_needed + min_passages_needed < effective_k_select:
-                if min_tables_needed < ideal_tables and num_available_tables > min_tables_needed:
-                    min_tables_needed = min(num_available_tables, min_tables_needed + (effective_k_select - (min_tables_needed + min_passages_needed)))
-                if min_passages_needed < ideal_passages and num_available_passages > min_passages_needed:
-                     min_passages_needed = min(num_available_passages, min_passages_needed + (effective_k_select - (min_tables_needed + min_passages_needed)))
-        
-        mip_setup_start_time = time.time()
-        R = [obj['relevance_score_R_i'] for obj in candidate_objects]
-        C = np.zeros((num_objects, num_objects))
-
-        all_texts_for_embedding = set()
-        for obj in candidate_objects:
-            if obj['source_type'] == 'table' and obj['parsed_content']:
-                for header in obj['parsed_content']['columns'].keys():
-                    all_texts_for_embedding.add(header)
-                for cell_list in obj['parsed_content']['columns'].values():
-                    for cell_content in cell_list:
-                        all_texts_for_embedding.add(cell_content)
-            elif obj['source_type'] == 'passage':
-                all_texts_for_embedding.add(obj['text'])
-        
-        unique_texts_list = list(all_texts_for_embedding)
-        text_to_embedding_map: Dict[str, torch.Tensor] = {}
-
-        if unique_texts_list:
-            all_embeddings = self.faiss_dense_retriever.faiss_encode(unique_texts_list,self.faiss_index_path)
-            for text, embedding_tensor in zip(unique_texts_list, all_embeddings):
-                text_to_embedding_map[text] = embedding_tensor
-
-        tokens_cache_for_mip: Dict[str, Set[str]] = {}
-
-        tt_time = tp_time = pp_time = 0.0
-        for i in range(num_objects):
-            for j in range(i + 1, num_objects):
-                obj_i = candidate_objects[i]; obj_j = candidate_objects[j]
-                comp_val = 0.0
-                
-                if obj_i['source_type'] == 'table' and obj_j['source_type'] == 'table':
-                    if obj_i['parsed_content'] and obj_j['parsed_content']:
-                        t0 = time.time()
-                        comp_val = self._calculate_table_table_compatibility_optimized(
-                            obj_i['parsed_content'], obj_j['parsed_content'], 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tt_time += time.time() - t0
-                elif obj_i['source_type'] == 'table' and obj_j['source_type'] == 'passage':
-                    if obj_i['parsed_content']:
-                        t0 = time.time()
-                        passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
-                        comp_val = self._calculate_table_passage_compatibility_optimized(
-                            obj_i['parsed_content'], obj_j['text'], passage_j_embedding, 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tp_time += time.time() - t0
-                elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'table':
-                    if obj_j['parsed_content']:
-                        t0 = time.time()
-                        passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
-                        comp_val = self._calculate_table_passage_compatibility_optimized(
-                            obj_j['parsed_content'], obj_i['text'], passage_i_embedding, 
-                            text_to_embedding_map, tokens_cache_for_mip)
-                        tp_time += time.time() - t0
-                elif obj_i['source_type'] == 'passage' and obj_j['source_type'] == 'passage':
-                    t0 = time.time()
-                    passage_i_embedding = text_to_embedding_map.get(obj_i['text'])
-                    passage_j_embedding = text_to_embedding_map.get(obj_j['text'])
-                    comp_val = self._calculate_passage_passage_compatibility_optimized(
-                        obj_i['text'], passage_i_embedding, 
-                        obj_j['text'], passage_j_embedding,
-                        tokens_cache_for_mip)
-                    pp_time += time.time() - t0
-                C[i, j] = C[j, i] = comp_val
-        
-        prob = LpProblem("ObjectSelectionMIP", LpMaximize)
-        b = [LpVariable(f"b_{i}", cat=LpBinary) for i in range(num_objects)]
-        c_vars = {}
-        for i in range(num_objects):
-            for j in range(i + 1, num_objects):
-                if C[i][j] > 1e-6: 
-                     c_vars[(i,j)] = LpVariable(f"c_{i}_{j}", cat=LpBinary)
-
-        objective = lpSum(R[i] * b[i] for i in range(num_objects))
-        if c_vars: 
-            objective += lpSum(C[i][j] * c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars)
-        prob += objective
-
-        prob += lpSum(b[i] for i in range(num_objects)) == effective_k_select, "TotalObjectsConstraint"
-        if c_vars:
-            if effective_k_select > 1:
-                 prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars) <= 2 * (effective_k_select - 1), "MaxConnectionsConstraint"
-            elif effective_k_select == 1: 
-                 prob += lpSum(c_vars[(i,j)] for i in range(num_objects) for j in range(i+1, num_objects) if (i,j) in c_vars) == 0, "NoConnectionsForK1Constraint"
-            
-            for i in range(num_objects):
-                for j in range(i + 1, num_objects):
-                    if (i,j) in c_vars: 
-                        prob += 2 * c_vars[(i,j)] <= b[i] + b[j], f"ConnectionIntegrity_{i}_{j}"
-        
-        if table_indices and min_tables_needed > 0:
-            prob += lpSum(b[i] for i in table_indices) >= min_tables_needed, "MinTablesConstraint"
-        if passage_indices and min_passages_needed > 0:
-            prob += lpSum(b[i] for i in passage_indices) >= min_passages_needed, "MinPassagesConstraint"
-
-        solver_used = None
-        # Try Gurobi first
-        try :
-            prob.solve(GUROBI_CMD(msg=0, timeLimit=30)) 
-            if prob.status == 1:
-                solver_used = "Gurobi"
-            else:
-                print(f"Gurobi solver ran but did not find an optimal solution (status: {prob.status}).")
-        except PulpSolverError as e:
-            pass
-        if solver_used is None and prob.status != 1:
-            prob.solve(PULP_CBC_CMD(msg=0, timeLimit=30))
-            if prob.status == 1:
-                solver_used = "CBC"
-            else:
-                print(f"CBC solver ran but did not find an optimal solution (status: {prob.status}).")
-        
-        selected_objects_indices = []
-        if prob.status == 1: 
-            selected_objects_indices = [i for i, var_b in enumerate(b) if var_b.value() is not None and var_b.value() > 0.5]
-        
-        return [candidate_objects[i] for i in selected_objects_indices]
-    
-    @staticmethod
-    def configure_list_size(string_list, n):
-        if not string_list:
-            return []
-        if len(string_list) <= n:
-            return string_list
-        max_s_len = 0
-        for s_item in string_list:
-            if len(s_item) > max_s_len:
-                max_s_len = len(s_item)
-        optimal_trunc_len = 0
-        low = 0
-        high = max_s_len
-
-        while low <= high:
-            mid_len = low + (high - low) // 2
-            
-            truncated_set = {s_val[:mid_len] for s_val in string_list}
-            
-            if len(truncated_set) <= n:
-                optimal_trunc_len = mid_len
-                low = mid_len + 1 
-            else:
-                high = mid_len - 1
-                
-        final_truncated_set = {s_val[:optimal_trunc_len] for s_val in string_list}
-        return list(final_truncated_set)
-
     
     @staticmethod
     def _get_initial_prompt_string(user_query: str) -> str:
@@ -686,82 +327,147 @@ class ARMRetriever(BaseRetriever):
             User question: {user_query}
             The relevant keywords are:""")
     
-    def _perform_arm_retrieval_for_query(self, user_query: str):
-        print(f"--- Starting Keyword and N-gram Generation for query: '{user_query}' ---")
-        keywords: List[str] = []
-        all_final_ngrams_for_retrieval: List[str] = []
+    
+    def rewrite_keyword(self, keyword: str, num_beams: int = 1, max_new_tokens: int = 30,length_penalty: float = 0.0,repetition_penalty: float = 1.0):
+        messages = [
+            {"role": "system", "content": f"You are an expert assistant. Your task is to rewrite the user's keyword. The rewritten keyword must be one of the allowed phrases (n-grams of 1 to 4 words from a document). **If the original keyword itself is an allowed phrase, please use it directly.** Otherwise, use the shortest, most relevant allowed phrase. Enclose the chosen phrase strictly with {self.soi_token_str} and {self.eoi_token_str} tokens. Example: {self.soi_token_str}an example phrase{self.eoi_token_str}"},
+            {"role": "user", "content": f"Rewrite the keyword '{keyword}' using only an allowed phrase from the document."}
+        ]
+        #lowercase the keyword to ensure consistency
+        keyword = keyword.lower().strip()
+        prompt_string_from_template = self.ngram_llm_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_for_model_generation = prompt_string_from_template + self.soi_token_str
+        
+        input_ids_tensor = self.ngram_llm_tokenizer.encode(prompt_for_model_generation, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            output_ids_tensor = self.ngram_llm_model.generate(
+                input_ids_tensor,
+                logits_processor=[self.logits_processor_instance],
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                num_return_sequences=num_beams,
+                early_stopping=True, 
+                eos_token_id=self.ngram_llm_tokenizer.eoi_token_id, 
+                pad_token_id=self.ngram_llm_tokenizer.pad_token_id,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                do_sample=True,
+                temperature=1.0,
+            )
+        all_rewritten_keywords = [] 
+        all_raw_outputs = [] 
+        
+        for i in range(output_ids_tensor.shape[0]): 
+            generated_ids_only = output_ids_tensor[i][input_ids_tensor.shape[1]:] 
+            raw_generated_output_text = self.ngram_llm_tokenizer.decode(generated_ids_only, skip_special_tokens=False)
 
-        # 1. Keyword Generation using vLLM
+            final_rewritten_keyword = raw_generated_output_text
+            if raw_generated_output_text.endswith(self.eoi_token_str):
+                final_rewritten_keyword = raw_generated_output_text[:-len(self.eoi_token_str)].strip()
+            elif self.eoi_token_str in raw_generated_output_text:
+                final_rewritten_keyword = raw_generated_output_text.split(self.eoi_token_str)[0].strip()
+            
+            if final_rewritten_keyword.startswith(self.soi_token_str): 
+                 final_rewritten_keyword = final_rewritten_keyword[len(self.soi_token_str):].strip()
+
+
+            all_rewritten_keywords.append(final_rewritten_keyword)
+            all_raw_outputs.append(raw_generated_output_text)   
+
+        return all_rewritten_keywords, all_raw_outputs
+    
+    
+    def _perform_arm_retrieval_for_query(self, user_query: str):        
+        all_vllm_keywords_set = set()
+        keywords_for_rec_lm: List[str] = []
+        # 1. Keyword Generation using vLLM with beam search (n=5)
         if self.vllm_engine:
             keyword_prompt = self._get_keyword_generation_prompt_vllm(user_query)
             
-            # Define SamplingParams for this specific keyword generation task
             keyword_sampling_params = VLLM_SamplingParams(
-                temperature=0.0, 
+                temperature=1.0, 
                 max_tokens=150,  
-                stop=["\n", "<|eot_id|>", "The relevant n-grams are:"] 
+                stop=["\n", "<|eot_id|>", "The relevant n-grams are:"],
+                n=self.keyword_extraction_beams
             )
             
-            vllm_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params)
+            vllm_request_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params)
             
-            if vllm_outputs and vllm_outputs[0].outputs:
-                generated_keywords_text = vllm_outputs[0].outputs[0].text.strip()
-                # Post-process to remove any part of the stop sequence if it's included
+            for beam_completion_output in vllm_request_outputs[0].outputs: # Iterate through each beam's output
+                generated_keywords_text = beam_completion_output.text.strip()
                 for stop_seq in keyword_sampling_params.stop:
                     if stop_seq in generated_keywords_text:
-                        generated_keywords_text = generated_keywords_text.split(stop_seq)[0]
-                
-                keywords = [k.strip() for k in generated_keywords_text.split('|') if k.strip()][:self.max_keywords_per_query]
-                print(f"vLLM Generated Keywords: {keywords}")
-            else:
-                print("Warning: vLLM failed to generate keywords. Using full query as a keyword.")
-                keywords = [user_query] if user_query.strip() else []
+                        generated_keywords_text = generated_keywords_text.split(stop_seq, 1)[0].strip()
+                #lowercase the generated keywords text
+                generated_keywords_text = generated_keywords_text.lower()
+                beam_keywords = [k.strip() for k in generated_keywords_text.split('|') if k.strip()]
+                all_vllm_keywords_set.update(beam_keywords)
+            
+            keywords_for_rec_lm = list(all_vllm_keywords_set)
+            print(f"vLLM Generated Keywords (deduplicated from 5 beams): {keywords_for_rec_lm}")
         else:
             print("Warning: vLLM engine not initialized. Using full query as a keyword.")
-            keywords = [user_query] if user_query.strip() else []
+            keywords_for_rec_lm = [user_query] if user_query.strip() else []
 
-        # 2. N-gram Generation using RecLM-cgen (HF Transformers) for each keyword
+        keywords_for_rec_lm = [kw for kw in keywords_for_rec_lm if kw] 
+
+        # 2. N-gram Generation using RecLM-cgen (HF Transformers) for each deduplicated keyword
+        all_final_ngrams_for_retrieval_temp: List[str] = []
         if self.generate_n_grams:
-            system_message_ngram_task = (
-                "You are an expert assistant that corrects and aligns input keywords to match a predefined list of valid items. "
-                "Given a potentially misspelled or non-standard keyword, output the closest valid item from your knowledge base. "
-                "Enclose the valid item with <SOI> and <EOI>."
-            )
-            for keyword_text in keywords:
-                if not keyword_text: continue
-                user_instruction = f"The input keyword is: '{keyword_text}'. Please provide the corresponding valid item."
-                full_prompt_ngram = (
-                    f"System: {system_message_ngram_task}\n"
-                    f"User: {user_instruction}\n"
-                    f"Assistant: <SOI>" 
+            for keyword_text in keywords_for_rec_lm:
+                extracted_items, _ = self.rewrite_keyword( # Ignoring extracted_raw as per original
+                    keyword_text,
+                    num_beams=self.keyword_rephrasing_beams,
                 )
-
-                input_ids = self.ngram_llm_tokenizer.encode(full_prompt_ngram, return_tensors="pt").to(self.device)
-
-                with torch.no_grad(): # Disable gradient calculations for inference
-                    output_sequences = self.ngram_llm_model.generate(
-                        input_ids=input_ids,
-                        logits_processor=[self.ngram_corpus_logits_processor], 
-                        num_beams=self.keyword_rephrasing_beams, 
-                        max_new_tokens=10,
-                        pad_token_id=self.ngram_llm_tokenizer.pad_token_id,
-                        eos_token_id=[self.ngram_llm_tokenizer.eos_token_id, self.ngram_llm_tokenizer.eoi_token_id],
-                        num_return_sequences=self.keyword_rephrasing_beams, 
-                        early_stopping=True 
-                    )
-                for beam_output in output_sequences:
-                    generated_token_ids_full = beam_output.tolist()
-                    full_generated_text = self.ngram_llm_tokenizer.decode(generated_token_ids_full, skip_special_tokens=False)
-                    extracted_items = get_ctrl_item(full_generated_text)
-                    if extracted_items:
-                        all_final_ngrams_for_retrieval.extend(extracted_items)
+                all_final_ngrams_for_retrieval_temp.extend(extracted_items)
         else: 
-            all_final_ngrams_for_retrieval = [kw for kw in keywords if kw]
+            all_final_ngrams_for_retrieval_temp = [kw for kw in keywords_for_rec_lm if kw]
 
-        self.current_keywords = keywords
-        self.current_ngrams_for_retrieval = all_final_ngrams_for_retrieval
-        print(f"Keywords: {self.current_keywords}")
-        print(f"N-gram sets for retrieval: {self.current_ngrams_for_retrieval}")
+        processed_sub_ngrams: List[str] = []
+        for phrase in all_final_ngrams_for_retrieval_temp:
+            tokens = word_tokenize(phrase.lower())
+            filtered_tokens = [token for token in tokens if token.isalnum() and token not in self.stop_words_set]
+            
+            if not filtered_tokens:
+                continue
+
+            for ngram in generate_ngrams(filtered_tokens, self.corpus_ngram_min_len, self.corpus_ngram_max_len):
+                processed_sub_ngrams.append(" ".join(ngram))
+        
+        final_top_ngrams_for_retrieval: List[str] = []
+        if processed_sub_ngrams:
+            ngram_counts = Counter(processed_sub_ngrams)
+            # Sort n-grams by frequency in descending order
+            sorted_ngrams_with_counts = sorted(ngram_counts.items(), key=lambda item: item[1], reverse=True)
+            
+            # Separate candidates by count > 1 and count == 1
+            gt1_candidates = [(ng, count) for ng, count in sorted_ngrams_with_counts if count > 1]
+            eq1_candidates = [ng for ng, count in sorted_ngrams_with_counts if count == 1]
+
+            last_added_count = -1
+            # Add n-grams with count > 1, keeping all ties for the last added count
+            for ngram, count in gt1_candidates:
+                if len(final_top_ngrams_for_retrieval) < self.keywords_per_query:
+                    final_top_ngrams_for_retrieval.append(ngram)
+                    last_added_count = count
+                elif count == last_added_count: # Tie with count > 1
+                    final_top_ngrams_for_retrieval.append(ngram)
+                else: 
+                    break 
+            
+            if len(final_top_ngrams_for_retrieval) < self.keywords_per_query:
+                needed = self.keywords_per_query - len(final_top_ngrams_for_retrieval)
+                random.shuffle(eq1_candidates) # Shuffle for random selection
+                final_top_ngrams_for_retrieval.extend(eq1_candidates[:needed])
+        else:
+            print("Warning: No sub-ngrams generated after stopword removal and tokenization steps.")
+
+        self.current_keywords = keywords_for_rec_lm
+        self.current_ngrams_for_retrieval = final_top_ngrams_for_retrieval + self.current_keywords
+        
+        print(f"Selected Keywords (displaying first {len(self.current_keywords)} of {len(keywords_for_rec_lm)} unique vLLM keywords): {self.current_keywords}")
+        print(f"Final N-grams for retrieval (Top up to {len(self.current_ngrams_for_retrieval)}): {self.current_ngrams_for_retrieval}")
         print(f"--- Keyword and N-gram Generation Complete for query '{user_query}' ---")
         return
     
@@ -807,17 +513,18 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     arm = ARMRetriever(
-        #vllm_model_path = "gaunernst/gemma-3-27b-it-int4-awq",
-        vllm_model_path=None,
+        vllm_model_path = "gaunernst/gemma-3-27b-it-int4-awq",
         faiss_index_path = "assets/feverous/faiss_indexes/dense_row_UAE-Large-V1",
         bm25_index_path ="assets/feverous/pyserini_indexes/bm25_row_index",
-        ngram_llm_model_path="gaunernst/gemma-3-27b-it-int4-awq",
+        ngram_llm_model_path="meta-llama/Meta-Llama-3-8B-Instruct",
         keyword_alignment=False,
         generate_n_grams=True,
         constrained_id_generation=False,
         mip_k_select=10,
         expansion_k_compatible=0,
-        expansion_steps=1
+        expansion_steps=1,
+        keyword_rephrasing_beams=10,
+        vllm_tensor_parallel_size = 1
     )
     
     arm.index(
@@ -828,7 +535,7 @@ if __name__ == "__main__":
     )
     
     nlqs = [
-        "Yepiskoposan"
+        "Aramais Yepiskoposyan played for FC Ararat Yerevan, an Armenian football club based in Yerevan during 1986 to 1991."
     ]
     #lowercase all nlqs
     nlqs = [nlq.lower() for nlq in nlqs]
