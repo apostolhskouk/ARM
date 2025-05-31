@@ -1,6 +1,5 @@
 import json
 import time
-import os
 from typing import List, Dict
 from src.retrieval.base import BaseRetriever, RetrievalResult
 from src.retrieval.bm25 import PyseriniBM25Retriever
@@ -17,7 +16,7 @@ from src.retrieval.react import ReActRetriever
 from src.utils.recai_recommender import Trie_link, FastPrefixConstrainedLogitsProcessor, Node
 
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_subsampled.json")
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_compact.json")
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
@@ -77,8 +76,9 @@ if __name__ == "__main__":
                 faiss_index_path = "assets/feverous/faiss_indexes/dense_row_UAE-Large-V1",
                 bm25_index_path ="assets/feverous/pyserini_indexes/bm25_row_index",
                 ngram_llm_model_path="meta-llama/Meta-Llama-3-8B-Instruct",
-                mip_k_select=30,
-                vllm_tensor_parallel_size=1
+                vllm_tensor_parallel_size=1,
+                #above is the best
+                expansion_steps=0
             )
         }
         for name, init_func in retriever_instances.items():
@@ -99,7 +99,7 @@ if __name__ == "__main__":
                 "benchmark_file": str(BENCHMARK_FILE_PATH.name),
             }
             run = wandb.init(
-                project="feverous-retrieval-benchmark",
+                project="feverous-retrieval-benchmark-sample",
                 entity="lakhs",
                 group=f"level-{index_level}",
                 name=f"run-{index_level}-{retriever_name}",
