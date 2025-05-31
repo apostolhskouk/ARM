@@ -1,6 +1,6 @@
 import os
 import pickle
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from tqdm import tqdm
 import torch
 import faiss
@@ -33,17 +33,14 @@ class ARMRetriever(BaseRetriever):
                 ngram_llm_model_path :str,
                 embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
                 keyword_extraction_beams: int = 5,
-                mip_k_select: int = 5,
+                mip_k_select: int = 50,
                 compatibility_semantic_weight: float = 0.5,
                 compatibility_exact_weight: float = 0.5,
                 corpus_ngram_min_len: int = 1, # Renamed from trie_min_n_for_extraction
                 corpus_ngram_max_len: int = 3, # Renamed from trie_max_n_for_extraction
                 bm25_retriever_instance: Optional[PyseriniBM25Retriever] = None,
                 faiss_retriever_instance: Optional[FaissDenseRetriever] = None,
-                max_keyword_length: int = 20,
-                keyword_alignment :bool = True,
                 generate_n_grams:bool = True,
-                constrained_id_generation:bool = False,
                 expansion_k_compatible: int = 3,
                 expansion_steps: int = 1,
                 keyword_rephrasing_beams: int = 1,
@@ -76,7 +73,6 @@ class ARMRetriever(BaseRetriever):
 
         self.faiss_index: Optional[faiss.Index] = None
         self.faiss_text_to_idx_map: Optional[Dict[str, int]] = None
-        self.max_keyword_length = max_keyword_length
         self.generate_n_grams = generate_n_grams
         self.current_keywords: List[str] = []
         self.current_ngrams_for_retrieval: List[str] = []
@@ -116,7 +112,8 @@ class ARMRetriever(BaseRetriever):
         self.alignment_retrieval_k = alignment_retrieval_k
         self.expansion_k_compatible = expansion_k_compatible
         self.expansion_steps = expansion_steps
-        
+        self.all_queries_processed: int = 0
+        self.all_items_returned: int = 0
     def _initialize_vllm(self): 
         tokenizer = AutoTokenizer.from_pretrained(self.vllm_model_path, trust_remote_code=True, cache_dir=self.vllm_cache_dir)
         if tokenizer.pad_token is None:
@@ -129,7 +126,7 @@ class ARMRetriever(BaseRetriever):
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
                 gpu_memory_utilization=0.8, 
-                max_model_len=16384,
+                max_model_len=32768,
             )
         else:
             print("vLLM model path not provided. Skipping vLLM initialization.")
@@ -401,7 +398,7 @@ class ARMRetriever(BaseRetriever):
                 n=self.keyword_extraction_beams
             )
             
-            vllm_request_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params)
+            vllm_request_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params,use_tqdm=False)
             
             for beam_completion_output in vllm_request_outputs[0].outputs:
                 generated_keywords_text = beam_completion_output.text.strip()
@@ -482,7 +479,7 @@ class ARMRetriever(BaseRetriever):
         retrieved_docs_by_faiss = self.faiss_dense_retriever.retrieve(
             nlqs=[user_query], 
             output_folder=self.faiss_index_path, 
-            k=self.alignment_retrieval_k 
+            k=self.alignment_retrieval_k * 2
         )
         all_bm25_results_flat: List[RetrievalResult] = [item for sublist in retrieved_docs_by_bm25_nested for item in sublist]
         faiss_results_for_query: List[RetrievalResult] = retrieved_docs_by_faiss[0] if retrieved_docs_by_faiss else []
@@ -659,7 +656,6 @@ class ARMRetriever(BaseRetriever):
             keywords_string=serialized_keywords,
             serialized_objects=serialized_objects
         )
-        start_selection_time = time.time()
         selection_sampling_params = VLLM_SamplingParams(
             temperature=0.0,          # deterministic
             max_tokens=150,
@@ -669,7 +665,6 @@ class ARMRetriever(BaseRetriever):
         raw_llm_output = vllm_outputs[0].outputs[0].text
         llm_selected_string_ids = self.parse_selected_ids(raw_llm_output) # These are string IDs like "page_title_source_info"
         end_selection_time = time.time()
-        selection_time_elapsed = end_selection_time - start_selection_time # This variable is calculated but not used later; can be kept or removed.
 
         final_selected_objects_list = []
         for llm_id_str in llm_selected_string_ids:
@@ -677,9 +672,14 @@ class ARMRetriever(BaseRetriever):
                 final_selected_objects_list.append(mip_objects_map_for_final_selection[llm_id_str])
             else:
                 print(f"Warning: LLM-selected ID '{llm_id_str}' not found in the candidate map. Skipping this ID.")
-        
+        self.all_items_returned += len(final_selected_objects_list)
+        self.all_queries_processed += 1
         return final_selected_objects_list
     
+    def display_metrics(self, verbose=True) -> Tuple[float, float]:
+        avg_llm_calls = 1.0
+        avg_distinct = self.all_items_returned / self.all_queries_processed
+        return avg_distinct, avg_llm_calls
     @staticmethod
     def parse_selected_ids(raw_output: str) -> List[str]:
         # Remove the terminator, newlines & whitespace

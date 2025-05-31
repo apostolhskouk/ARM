@@ -70,12 +70,12 @@ class FaissDenseRetriever(BaseRetriever):
             return
         target_devices = [f'cuda:{i}' for i in range(self.num_gpus)] if self.num_gpus > 0 else ['cpu']
         pool = self.model.start_multi_process_pool(target_devices=target_devices)
-        encode_batch_size = 4
+        encode_batch_size = 32
         embeddings = self.model.encode_multi_process(
             texts,
             pool=pool,
             batch_size=encode_batch_size,
-            show_progress_bar=True,
+            show_progress_bar=self.enable_tqdm,
         )
         self.model.stop_multi_process_pool(pool)
         faiss.normalize_L2(embeddings)
