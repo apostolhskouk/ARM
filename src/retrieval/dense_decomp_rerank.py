@@ -2,6 +2,8 @@ from typing import List, Optional,Dict
 from src.retrieval.base import RetrievalResult
 from src.retrieval.dense_rerank import DenseRetrieverWithReranker
 from src.utils.query_decompostion import QueryDecomposer
+from src.utils.query_decomposition_vllm import QueryDecomposer as VLLMQueryDecomposer
+
 from tqdm import tqdm
 
 
@@ -17,21 +19,24 @@ class DenseRetrieverWithDecompositionAndReranker(DenseRetrieverWithReranker):
         self,
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
         reranker_model_name: str = "mixedbread-ai/mxbai-rerank-large-v2",
-        ollama_model: str = "llama3.1:8b",
-        decomposition_cache_folder: Optional[str] = None
+        model_name: str = "llama3.1:8b",
+        decomposition_cache_folder: Optional[str] = None,
+        use_vllm: bool = True
     ):
         super().__init__(
             embedding_model_name=embedding_model_name,
             reranker_model_name=reranker_model_name
         )
-        try:
+        self.use_vllm = use_vllm
+        if not self.use_vllm:
             self.decomposer = QueryDecomposer(
-                ollama_model=ollama_model,
+                model_name,
                 output_folder=decomposition_cache_folder
             )
-        except Exception as e:
-            print(f"Failed to initialize QueryDecomposer: {e}")
-            raise
+        else:
+            self.decomposer = VLLMQueryDecomposer(
+                output_folder=decomposition_cache_folder
+            )
 
     def retrieve(
         self,
@@ -47,14 +52,30 @@ class DenseRetrieverWithDecompositionAndReranker(DenseRetrieverWithReranker):
             return []
 
         # 1. Decompose all queries first
-        all_sub_queries: List[str] = []
-        original_query_indices: List[int] = [] # Map sub-query index back to original nlq index
+        if self.use_vllm:
+            decomposed_nlqs_batch: List[List[str]] = self.decomposer.decompose_batch(nlqs)
+    
+            all_sub_queries: List[str] = []
+            original_query_indices: List[int] = []
 
-        for i, nlq in enumerate(tqdm(nlqs,desc=f"Decomposing with {self.decomposer.ollama_model}")):
-            sub_queries = self.decomposer.decompose(nlq) or [nlq]
-            for sub_q in sub_queries:
-                all_sub_queries.append(sub_q)
-                original_query_indices.append(i)
+            for i, single_nlq_decompositions in enumerate(decomposed_nlqs_batch):
+                current_s_queries = single_nlq_decompositions if single_nlq_decompositions else [nlqs[i]]
+
+                for sub_q in current_s_queries:
+                    all_sub_queries.append(sub_q)
+                    original_query_indices.append(i)
+
+        else:
+    
+            all_sub_queries: List[str] = []
+            original_query_indices: List[int] = []
+
+            for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
+                sub_queries = self.decomposer.decompose(nlq) or [nlq]
+                for sub_q in sub_queries:
+                    all_sub_queries.append(sub_q)
+                    original_query_indices.append(i)
+
 
         if not all_sub_queries:
             return [[] for _ in nlqs]

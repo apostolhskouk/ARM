@@ -15,7 +15,7 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
         model_name: str = "llama3.1:8b",
         decomposition_cache_folder: Optional[str] = None,
-        use_vllm: bool = False
+        use_vllm: bool = True
     ):
         super().__init__(model_name_or_path=embedding_model_name)
         self.use_vllm = use_vllm
@@ -47,11 +47,9 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     
             all_sub_queries: List[str] = []
             original_query_indices: List[int] = []
-            sub_query_groups: List[List[str]] = [] 
 
             for i, single_nlq_decompositions in enumerate(decomposed_nlqs_batch):
                 current_s_queries = single_nlq_decompositions if single_nlq_decompositions else [nlqs[i]]
-                sub_query_groups.append(current_s_queries)
 
                 for sub_q in current_s_queries:
                     all_sub_queries.append(sub_q)
@@ -61,11 +59,9 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     
             all_sub_queries: List[str] = []
             original_query_indices: List[int] = []
-            sub_query_groups: List[List[str]] = []
 
             for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
                 sub_queries = self.decomposer.decompose(nlq) or [nlq]
-                sub_query_groups.append(sub_queries)
                 for sub_q in sub_queries:
                     all_sub_queries.append(sub_q)
                     original_query_indices.append(i)

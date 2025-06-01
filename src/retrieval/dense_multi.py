@@ -16,7 +16,7 @@ class FaissDenseRetriever(BaseRetriever):
     INDEX_FILENAME = "index.faiss"
     METADATA_FILENAME = "metadata.pkl"
 
-    def __init__(self, model_name_or_path: str = "WhereIsAI/UAE-Large-V1", enable_tqdm: bool = True):
+    def __init__(self, model_name_or_path: str = "WhereIsAI/UAE-Large-V1", enable_tqdm: bool = True, procs_per_gpu: int = 15):
         """
         Initializes the retriever with a Sentence Transformer model.
 
@@ -24,7 +24,7 @@ class FaissDenseRetriever(BaseRetriever):
             model_name_or_path: The name/path of the Sentence Transformer model to use.
         """
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = SentenceTransformer(model_name_or_path, device=device,trust_remote_code=True)
+        self.model = SentenceTransformer(model_name_or_path, device=device, trust_remote_code=True)
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         self.num_gpus = torch.cuda.device_count()
 
@@ -33,7 +33,7 @@ class FaissDenseRetriever(BaseRetriever):
         self.text_to_id_map: Optional[Dict[str, int]] = None
         self._loaded_output_folder: Optional[str] = None
         self.enable_tqdm = enable_tqdm
-
+        self.procs_per_gpu = procs_per_gpu
     def index(self,
               input_jsonl_path: str,
               output_folder: str,
@@ -68,9 +68,20 @@ class FaissDenseRetriever(BaseRetriever):
         if not texts:
             print("No valid documents to index.")
             return
-        target_devices = [f'cuda:{i}' for i in range(self.num_gpus)] if self.num_gpus > 0 else ['cpu']
+
+        # Build a list of devices, repeating each GPU procs_per_gpu times
+        if self.num_gpus > 0:
+            target_devices = [
+                f"cuda:{gpu_index}"
+                for gpu_index in range(self.num_gpus)
+                for _ in range(self.procs_per_gpu)
+            ]
+        else:
+            # If no GPU is available, spawn procs_per_gpu CPU workers
+            target_devices = ["cpu"] * self.procs_per_gpu
+
         pool = self.model.start_multi_process_pool(target_devices=target_devices)
-        encode_batch_size = 16
+        encode_batch_size = 4
         embeddings = self.model.encode_multi_process(
             texts,
             pool=pool,
@@ -78,6 +89,7 @@ class FaissDenseRetriever(BaseRetriever):
             show_progress_bar=self.enable_tqdm,
         )
         self.model.stop_multi_process_pool(pool)
+
         faiss.normalize_L2(embeddings)
         index = faiss.IndexFlatIP(self.embedding_dim)
         index.add(embeddings)
@@ -85,11 +97,12 @@ class FaissDenseRetriever(BaseRetriever):
         faiss.write_index(index, index_path)
         with open(metadata_path, 'wb') as f:
             pickle.dump(metadata_list, f)
+
+        # Free up memory
         del embeddings
         del texts
         del metadata_list
-        torch.cuda.empty_cache() 
-
+        torch.cuda.empty_cache()
     def retrieve(self,
                  nlqs: List[str],
                  output_folder: str,

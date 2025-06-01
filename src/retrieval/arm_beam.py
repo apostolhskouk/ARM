@@ -125,7 +125,7 @@ class ARMRetriever(BaseRetriever):
                 tokenizer=tokenizer.name_or_path,
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
-                gpu_memory_utilization=0.8, 
+                gpu_memory_utilization=0.9, 
                 max_model_len=32768,
             )
         else:
@@ -294,17 +294,17 @@ class ARMRetriever(BaseRetriever):
             lead single | album 'Echoes of Tomorrow' | The Cosmic Rays | year released
 
             Here are the objects that can be relevant to answer the user query:
-            Id: 'Echoes of Tomorrow_sentence_0' : Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
-            Id: 'Echoes of Tomorrow_table_0' : Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
-            Id: 'The Cosmic Rays_sentence_0' : The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
-            Id: 'Starlight Serenade_sentence_0' : Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
-            Id: 'Celestial Journey_table_0' : Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
-            Id: 'Music Reviews_sentence_0' : Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
-            Id: 'The Cosmic Rays_table_0' : The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
-            Id: 'Echoes of Tomorrow_sentence_1' : Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
+            Id: 'sentence_0' : Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
+            Id: 'sentence_1' : The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
+            Id: 'table_0' : Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
+            Id: 'sentence_2' : Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
+            Id: 'table_1' : Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
+            Id: 'sentence_3' : Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
+            Id: 'table_2' : The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
+            Id: 'sentence_4' : Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
 
             From the above objects, here are the IDs of those that are enough to answer the query:
-            Echoes of Tomorrow_sentence_0,Echoes of Tomorrow_table_0
+            sentence_0,table_0
             <>
 
             **Now it’s your turn.**
@@ -636,25 +636,63 @@ class ARMRetriever(BaseRetriever):
                 k_select=self.mip_k_select
             )
         
-        object_ids_for_llm_selection = []
-        mip_objects_map_for_final_selection = {} 
+        llm_id_to_original_data_map = {}
         serialized_objects = str()
-        for idx, obj_data_item in enumerate(selected_objects_by_mip):
+        sentence_counter = 1
+        table_counter = 1
+
+        for obj_data_item in selected_objects_by_mip:
+            # Step 1: Construct the string that would have been used to form the old 'object_llm_id'.
+            # This string is checked for "sentence_" or "table_" to determine the simple ID type.
             meta = obj_data_item.get('metadata', {})
-            page_title = meta.get('page_title', f"untitled_{obj_data_item['id']}") # Use obj_data_item['id'] for more uniqueness
+            # Use obj_data_item['id'] (the true unique ID from upstream) for more robust fallback titles/sources
+            page_title = meta.get('page_title', f"untitled_{obj_data_item['id']}")
             source_info = meta.get('source', f"unknownsrc_{obj_data_item['id']}")
-            object_llm_id = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_").replace("/", "_") # Sanitize more
+            
+            # This is the string to check for "sentence_" or "table_" clues.
+            # It's based on the old logic for object_llm_id.
+            id_to_check_for_type_clues = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_").replace("/", "_").lower()
 
-            object_ids_for_llm_selection.append(object_llm_id)
-            mip_objects_map_for_final_selection[object_llm_id] = obj_data_item
+            simple_llm_id = None # Initialize
 
-            serialized_objects += f"Id: '{object_llm_id}' : {obj_data_item['text']}\n"
+            # Step 2: Determine the simple ID based on the content of id_to_check_for_type_clues
+            if "sentence_" in id_to_check_for_type_clues:
+                simple_llm_id = f"sentence_{sentence_counter}"
+                sentence_counter += 1
+            elif "table_" in id_to_check_for_type_clues:
+                simple_llm_id = f"table_{table_counter}"
+                table_counter += 1
+            else:
+                # Fallback: If the constructed ID string doesn't contain "sentence_" or "table_",
+                # we can check 'source_type' from the object data as a more robust indicator.
+                source_type = obj_data_item.get('source_type')
+                if source_type == 'passage': # Assuming 'passage' corresponds to 'sentence'
+                    simple_llm_id = f"sentence_{sentence_counter}"
+                    sentence_counter += 1
+                elif source_type == 'table':
+                    simple_llm_id = f"table_{table_counter}"
+                    table_counter += 1
+                else:
+                    # If the object cannot be categorized as 'sentence' or 'table'
+                    # it will be excluded from LLM selection under the new simple ID scheme.
+                    print(f"Warning: Object with original ID '{obj_data_item['id']}' "
+                          f"(checked string: '{id_to_check_for_type_clues}', source_type: {source_type}) "
+                          f"could not be mapped to 'sentence_X' or 'table_X'. "
+                          f"It will be excluded from LLM selection with a simple ID.")
+                    continue # Skip this object and do not include it in the prompt
+
+            # Step 3: Store mapping and build serialized string for prompt
+            # The key for the map is the new simple_llm_id.
+            # The value is the original object data, which contains the original complex ID ('id')
+            # and all other necessary information.
+            llm_id_to_original_data_map[simple_llm_id] = obj_data_item
+            serialized_objects += f"Id: '{simple_llm_id}' : {obj_data_item['text']}\n"
             
         serialized_keywords = " | ".join(self.current_keywords)
         selection_prompt = self._get_final_selection_prompt(
             user_query=user_query,
             keywords_string=serialized_keywords,
-            serialized_objects=serialized_objects
+            serialized_objects=serialized_objects 
         )
         selection_sampling_params = VLLM_SamplingParams(
             temperature=0.0,          # deterministic
@@ -663,15 +701,22 @@ class ARMRetriever(BaseRetriever):
         )
         vllm_outputs = self.vllm_engine.generate([selection_prompt], selection_sampling_params,use_tqdm=False)
         raw_llm_output = vllm_outputs[0].outputs[0].text
-        llm_selected_string_ids = self.parse_selected_ids(raw_llm_output) # These are string IDs like "page_title_source_info"
-        end_selection_time = time.time()
+        # llm_selected_string_ids will contain simple IDs like "sentence_1", "table_3"
+        llm_selected_simple_ids = self.parse_selected_ids(raw_llm_output) 
 
         final_selected_objects_list = []
-        for llm_id_str in llm_selected_string_ids:
-            if llm_id_str in mip_objects_map_for_final_selection:
-                final_selected_objects_list.append(mip_objects_map_for_final_selection[llm_id_str])
+        # llm_selected_simple_ids now contains the simple IDs (e.g., "sentence_1", "table_1")
+        # that the LLM selected.
+        for simple_id_str in llm_selected_simple_ids:
+            # Use the new map to look up the original object data using the simple ID.
+            if simple_id_str in llm_id_to_original_data_map:
+                final_selected_objects_list.append(llm_id_to_original_data_map[simple_id_str])
             else:
-                print(f"Warning: LLM-selected ID '{llm_id_str}' not found in the candidate map. Skipping this ID.")
+                # This can happen if LLM hallucinates an ID or if parse_selected_ids is imperfect
+                # or if an object was skipped during simple ID generation but LLM still tried to pick it.
+                print(f"Warning: LLM-selected simple ID '{simple_id_str}' not found in the mapping. "
+                      f"This ID might have been hallucinated by the LLM or was not mappable. Skipping this ID.")
+                
         self.all_items_returned += len(final_selected_objects_list)
         self.all_queries_processed += 1
         return final_selected_objects_list
