@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 class QueryDecomposer:
     def __init__(self,
-                 model_name_or_path: str = "Qwen/Qwen3-32B",
+                 model_name_or_path: str = "gaunernst/gemma-3-27b-it-int4-awq",
                  output_folder: Optional[str] = None,
                  tensor_parallel_size: int = 2,
                  quantization: Optional[str] = "fp8",
