@@ -7,16 +7,18 @@ from src.retrieval.dense import FaissDenseRetriever
 from src.retrieval.dense_rerank import DenseRetrieverWithReranker
 from src.retrieval.dense_decomp import DenseRetrieverWithDecomposition
 from src.retrieval.dense_decomp_rerank import DenseRetrieverWithDecompositionAndReranker
-from src.feverous.feverous_evaluator import FeverousEvaluation
 from src.retrieval.arm_beam import ARMRetriever
+from src.retrieval.react import ReActRetriever 
+from src.feverous.feverous_evaluator import FeverousEvaluation
+
 from pathlib import Path
 import pandas as pd
 import wandb
-from src.retrieval.react import ReActRetriever 
+
 from src.utils.recai_recommender import Trie_link, FastPrefixConstrainedLogitsProcessor, Node
 
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_compact.json")
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_subsampled.json")
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"

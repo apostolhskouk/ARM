@@ -24,16 +24,16 @@ BENCHMARK_FILENAMES = [
 
 RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
     "BM25": PyseriniBM25Retriever,
-    "Dense": FaissDenseRetriever,
-    "DenseRerank": DenseRetrieverWithReranker,
-    "DenseDecomp": DenseRetrieverWithDecomposition,
-    "DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
-    "ARM": ARMRetriever,
-    "ReAct": ReActRetriever,
+    #"Dense": FaissDenseRetriever,
+    #"DenseRerank": DenseRetrieverWithReranker,
+    #"DenseDecomp": DenseRetrieverWithDecomposition,
+    #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
+    #"ARM": ARMRetriever,
+    #"ReAct": ReActRetriever,
 }
 
 BM25_INDEX_BASE_DIR = Path("assets/all_data/indexes/bm25/")
-DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_infly_v1_1.5b/")
+DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_arctic_embed_m_v2")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
 RETRIEVAL_K = 50
 WANDB_PROJECT_NAME = "all_benchamrks"
@@ -66,7 +66,40 @@ def main():
     evaluator = EvaluationMetrics(n_values=EVALUATION_N_VALUES)
 
     for retriever_name, RetrieverClass in RETRIEVERS_CONFIG.items():
-        retriever_instance = RetrieverClass()
+        retriever_instance: BaseRetriever
+        if retriever_name == "BM25":
+            retriever_instance = RetrieverClass()
+        elif retriever_name == "Dense":
+            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER)
+        elif retriever_name == "DenseRerank":
+            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER)
+        elif retriever_name == "DenseDecomp":
+            retriever_instance = RetrieverClass(
+                embedding_model_name=EMBEDDING_MODEL_INF_RETRIEVER,
+                model_name=DECOMPOSITION_MODEL_NAME,
+                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
+            )
+        elif retriever_name == "DenseDecompRerank":
+            retriever_instance = RetrieverClass(
+                embedding_model_name=EMBEDDING_MODEL_INF_RETRIEVER,
+                model_name=DECOMPOSITION_MODEL_NAME,
+                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
+            )
+        elif retriever_name == "ReAct":
+            retriever_instance = RetrieverClass(
+                dense_model_name_or_path=EMBEDDING_MODEL_INF_RETRIEVER,
+                model_path=REACT_LLM_MODEL_PATH
+            )
+        elif retriever_name == "ARM":
+            retriever_instance = RetrieverClass(
+                vllm_model_path=ARM_VLLM_MODEL_PATH,
+                faiss_index_path=str(DENSE_INDEX_BASE_DIR),
+                bm25_index_path=str(BM25_INDEX_BASE_DIR),
+                ngram_llm_model_path=ARM_NGRAM_LLM_MODEL_PATH,
+                vllm_tensor_parallel_size=1,
+                expansion_steps=0
+            )
+        
         is_agentic_retriever = isinstance(retriever_instance, (ARMRetriever, ReActRetriever))
 
         for benchmark_filename in BENCHMARK_FILENAMES:
@@ -84,6 +117,11 @@ def main():
                 "retrieval_k_passed_to_method": RETRIEVAL_K,
                 "wandb_project": WANDB_PROJECT_NAME,
                 "wandb_entity": WANDB_ENTITY_NAME,
+                "embedding_model (if_applicable)": EMBEDDING_MODEL_INF_RETRIEVER if retriever_name not in ["BM25"] else "N/A",
+                "decomposition_llm (if_applicable)": DECOMPOSITION_MODEL_NAME if "Decomp" in retriever_name else "N/A",
+                "react_llm (if_applicable)": REACT_LLM_MODEL_PATH if retriever_name == "ReAct" else "N/A",
+                "arm_vllm (if_applicable)": ARM_VLLM_MODEL_PATH if retriever_name == "ARM" else "N/A",
+                "arm_ngram_llm (if_applicable)": ARM_NGRAM_LLM_MODEL_PATH if retriever_name == "ARM" else "N/A",
             }
             
             run = wandb.init(
@@ -114,7 +152,7 @@ def main():
                 "queries_per_second": num_queries / retrieval_time if retrieval_time > 0 else 0
             })
 
-            predicted_doc_ids_list = [[res.object for res in inner_list] for inner_list in retrieved_results_nested_list]
+            predicted_doc_ids_list = [[f"{res.metadata['page_title']}_{res.metadata['source']}" for res in inner_list] for inner_list in retrieved_results_nested_list]
 
             if is_agentic_retriever:
                 avg_distinct, avg_calls = retriever_instance.display_metrics(verbose=False)
