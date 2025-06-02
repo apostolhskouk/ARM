@@ -20,7 +20,7 @@ class FaissDenseRetriever(BaseRetriever):
                  model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
                  enable_tqdm: bool = True,
                  use_vllm_indexing: bool = False,
-                 use_infinity_indexing: bool = False):
+                 use_infinity_indexing: bool = True):
 
         self.model_name_or_path = model_name_or_path
         self.enable_tqdm = enable_tqdm
@@ -47,7 +47,6 @@ class FaissDenseRetriever(BaseRetriever):
                 tensor_parallel_size=self.num_gpus if self.num_gpus > 0 else 1,
                 task="embed",
                 enforce_eager=True,
-                max_model_len=8192*2
             )
             self.embedding_dim = self.vllm_model.llm_engine.model_config.get_hidden_size()
         elif self.selected_backend == "infinity":
@@ -86,7 +85,7 @@ class FaissDenseRetriever(BaseRetriever):
             return
         texts, current_metadata_list = [], []
         with open(input_jsonl_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for i, line in enumerate(f):
                 data = json.loads(line.strip())
                 text = data[field_to_index]
                 texts.append(text)
@@ -100,7 +99,7 @@ class FaissDenseRetriever(BaseRetriever):
         final_metadata_list = current_metadata_list
 
         if self.selected_backend == "vllm":
-            request_outputs = self.vllm_model.embed(texts)
+            request_outputs = self.vllm_model.embed(texts,truncate_prompt_tokens=8192)
             processed_embeddings = []
             for i, output in enumerate(request_outputs):
                 processed_embeddings.append(output.outputs.embedding)
