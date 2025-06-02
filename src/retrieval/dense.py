@@ -3,93 +3,160 @@ import os
 import pickle
 from typing import List, Dict, Any, Optional
 from tqdm.auto import tqdm
-from sentence_transformers import SentenceTransformer
 import faiss
 import torch
-from src.retrieval.base import BaseRetriever, RetrievalResult
+from src.retrieval.base import BaseRetriever, RetrievalResult # Assuming this base class exists
 import numpy as np
+from vllm import LLM, SamplingParams
+from sentence_transformers import SentenceTransformer as ImportedSentenceTransformer
+import asyncio
+from infinity_emb import AsyncEngineArray, EngineArgs
+
 class FaissDenseRetriever(BaseRetriever):
-    """
-    Dense Retriever implementation using Sentence Transformers and FAISS.
-    Indexes using FAISS CPU, retrieves using FAISS GPU if available.
-    """
     INDEX_FILENAME = "index.faiss"
     METADATA_FILENAME = "metadata.pkl"
 
-    def __init__(self, model_name_or_path: str = "WhereIsAI/UAE-Large-V1", enable_tqdm: bool = True):
-        """
-        Initializes the retriever with a Sentence Transformer model.
+    def __init__(self,
+                 model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
+                 enable_tqdm: bool = True,
+                 use_vllm_indexing: bool = False,
+                 use_infinity_indexing: bool = False):
 
-        Args:
-            model_name_or_path: The name/path of the Sentence Transformer model to use.
-        """
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = SentenceTransformer(model_name_or_path, device=device,trust_remote_code=True)
-        self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        self.model_name_or_path = model_name_or_path
+        self.enable_tqdm = enable_tqdm
+        self.use_vllm_indexing = use_vllm_indexing
+        self.use_infinity_indexing = use_infinity_indexing
         self.num_gpus = torch.cuda.device_count()
+
+        self.st_model = None
+        self.vllm_model = None
+        self.vllm_sampling_params = None
+        self.infinity_engine_array: Optional[AsyncEngineArray] = None
+        self.embedding_dim: Optional[int] = None
+
+        self.selected_backend = "sentence_transformer"
+        if self.use_vllm_indexing:
+            self.selected_backend = "vllm"
+        elif self.use_infinity_indexing:
+            self.selected_backend = "infinity"
+
+        if self.selected_backend == "vllm":
+            self.vllm_model = LLM(
+                model=self.model_name_or_path,
+                trust_remote_code=True,
+                tensor_parallel_size=self.num_gpus if self.num_gpus > 0 else 1,
+                task="embed",
+                enforce_eager=True,
+                max_model_len=8192*2
+            )
+            self.embedding_dim = self.vllm_model.llm_engine.model_config.get_hidden_size()
+        elif self.selected_backend == "infinity":
+            engine_args = EngineArgs(
+                model_name_or_path=self.model_name_or_path
+            )
+            self.infinity_engine_array = AsyncEngineArray.from_args([engine_args])
+            self.embedding_dim = None
+        else:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.st_model = ImportedSentenceTransformer(
+                self.model_name_or_path,
+                device=device,
+                trust_remote_code=True,
+                cache_folder="assets/cache"
+            )
+            self.st_model.max_seq_length = 8192
+            self.embedding_dim = self.st_model.get_sentence_embedding_dimension()
 
         self.faiss_index_cpu: Optional[faiss.Index] = None
         self.doc_metadata_list: Optional[List[Dict[str, Any]]] = None
         self.text_to_id_map: Optional[Dict[str, int]] = None
         self._loaded_output_folder: Optional[str] = None
-        self.enable_tqdm = enable_tqdm
 
     def index(self,
               input_jsonl_path: str,
               output_folder: str,
               field_to_index: str,
               metadata_fields: List[str]) -> None:
-        """
-        Indexes documents by embedding text and storing in a FAISS CPU index.
-        Also saves metadata associated with each document.
-        """
+
         os.makedirs(output_folder, exist_ok=True)
         index_path = os.path.join(output_folder, self.INDEX_FILENAME)
         metadata_path = os.path.join(output_folder, self.METADATA_FILENAME)
-
         if os.path.exists(index_path) and os.path.exists(metadata_path):
             print(f"Index and metadata exist in '{output_folder}', skipping.")
             return
-
-        texts, metadata_list = [], []
+        texts, current_metadata_list = [], []
         with open(input_jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line.strip())
-                text = data.get(field_to_index)
-                if not text or not isinstance(text, str):
-                    continue
+                text = data[field_to_index]
                 texts.append(text)
                 entry = {'_text': text}
                 for field in metadata_fields:
                     if field in data:
                         entry[field] = data[field]
-                metadata_list.append(entry)
+                current_metadata_list.append(entry)
 
-        if not texts:
-            print("No valid documents to index.")
-            return
-        target_devices = [f'cuda:{i}' for i in range(self.num_gpus)] if self.num_gpus > 0 else ['cpu']
-        pool = self.model.start_multi_process_pool(target_devices=target_devices)
-        encode_batch_size = 16
-        embeddings = self.model.encode_multi_process(
-            texts,
-            pool=pool,
-            batch_size=encode_batch_size,
-            show_progress_bar=self.enable_tqdm,
-        )
-        self.model.stop_multi_process_pool(pool)
-        faiss.normalize_L2(embeddings)
+        embeddings_np: Optional[np.ndarray] = None
+        final_metadata_list = current_metadata_list
+
+        if self.selected_backend == "vllm":
+            request_outputs = self.vllm_model.embed(texts)
+            processed_embeddings = []
+            for i, output in enumerate(request_outputs):
+                processed_embeddings.append(output.outputs.embedding)
+            embeddings_np = np.array(processed_embeddings, dtype=np.float32)
+        elif self.selected_backend == "infinity":
+            engine = self.infinity_engine_array[0]
+
+            async def _embed_texts_with_infinity(texts_to_embed):
+                await engine.astart()
+                all_raw_embeddings_list = []
+                if self.enable_tqdm and len(texts_to_embed) > 0:
+                    batch_size = 64
+                    for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding with Infinity"):
+                        batch = texts_to_embed[i:i + batch_size]
+                        batch_embeds, _ = await engine.embed(sentences=batch)
+                        all_raw_embeddings_list.extend(batch_embeds)
+                elif len(texts_to_embed) > 0:
+                    all_raw_embeddings_list, _ = await engine.embed(sentences=texts_to_embed)
+                await engine.astop()
+                return all_raw_embeddings_list
+
+            if len(texts) > 0:
+                raw_embeddings_list = asyncio.run(_embed_texts_with_infinity(texts))
+                embeddings_np = np.array(raw_embeddings_list, dtype=np.float32)
+                if self.embedding_dim is None:
+                    self.embedding_dim = embeddings_np.shape[1]
+            else:
+                embeddings_np = np.array([], dtype=np.float32)
+
+        else:
+            embeddings_np = self.st_model.encode(
+                texts,
+                batch_size=64,
+                show_progress_bar=self.enable_tqdm,
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+                truncation=True,
+            )
+
+        faiss.normalize_L2(embeddings_np)
         index = faiss.IndexFlatIP(self.embedding_dim)
-        index.add(embeddings)
+        index.add(embeddings_np)
 
         faiss.write_index(index, index_path)
         with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata_list, f)
-        del embeddings
-        del texts
-        del metadata_list
-        torch.cuda.empty_cache() 
+            pickle.dump(final_metadata_list, f)
 
+        del embeddings_np
+        del texts
+        del current_metadata_list
+        if 'processed_embeddings' in locals():
+            del processed_embeddings
+
+        torch.cuda.empty_cache()
+        
+        
     def retrieve(self,
                  nlqs: List[str],
                  output_folder: str,
