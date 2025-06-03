@@ -23,8 +23,8 @@ BENCHMARK_FILENAMES = [
 ]
 
 RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
-    "BM25": PyseriniBM25Retriever,
-    #"Dense": FaissDenseRetriever,
+    #"BM25": PyseriniBM25Retriever,
+    "Dense": FaissDenseRetriever,
     #"DenseRerank": DenseRetrieverWithReranker,
     #"DenseDecomp": DenseRetrieverWithDecomposition,
     #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
@@ -33,15 +33,15 @@ RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
 }
 
 BM25_INDEX_BASE_DIR = Path("assets/all_data/indexes/bm25/")
-DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_arctic_embed_m_v2")
+DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_artic_embed_s")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
 RETRIEVAL_K = 50
-WANDB_PROJECT_NAME = "all_benchamrks"
+WANDB_PROJECT_NAME = "all_benchmarks"
 WANDB_ENTITY_NAME = "lakhs"
 
 DECOMPOSITION_MODEL_NAME = "gaunernst/gemma-3-27b-it-int4-awq"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
-EMBEDDING_MODEL_INF_RETRIEVER = "infly/inf-retriever-v1-1.5b"
+EMBEDDING_MODEL_INF_RETRIEVER = "Snowflake/snowflake-arctic-embed-s"
 REACT_LLM_MODEL_PATH = "assets/cache/gemma-3-27b-it.Q4_K_M.gguf"
 ARM_VLLM_MODEL_PATH = "gaunernst/gemma-3-27b-it-int4-awq"
 ARM_NGRAM_LLM_MODEL_PATH = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -70,7 +70,7 @@ def main():
         if retriever_name == "BM25":
             retriever_instance = RetrieverClass()
         elif retriever_name == "Dense":
-            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER)
+            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER,use_infinity_indexing=False)
         elif retriever_name == "DenseRerank":
             retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER)
         elif retriever_name == "DenseDecomp":

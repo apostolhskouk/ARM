@@ -57,14 +57,14 @@ class FaissDenseRetriever(BaseRetriever):
             self.embedding_dim = None
         else:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.st_model = ImportedSentenceTransformer(
+            self.model = ImportedSentenceTransformer(
                 self.model_name_or_path,
                 device=device,
                 trust_remote_code=True,
                 cache_folder="assets/cache"
             )
-            self.st_model.max_seq_length = 8192
-            self.embedding_dim = self.st_model.get_sentence_embedding_dimension()
+            self.model.max_seq_length = 8192
+            self.embedding_dim = self.model.get_sentence_embedding_dimension()
 
         self.faiss_index_cpu: Optional[faiss.Index] = None
         self.doc_metadata_list: Optional[List[Dict[str, Any]]] = None
@@ -111,7 +111,7 @@ class FaissDenseRetriever(BaseRetriever):
                 await engine.astart()
                 all_raw_embeddings_list = []
                 if self.enable_tqdm and len(texts_to_embed) > 0:
-                    batch_size = 64
+                    batch_size = 1024
                     for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding with Infinity"):
                         batch = texts_to_embed[i:i + batch_size]
                         batch_embeds, _ = await engine.embed(sentences=batch)
@@ -130,7 +130,7 @@ class FaissDenseRetriever(BaseRetriever):
                 embeddings_np = np.array([], dtype=np.float32)
 
         else:
-            embeddings_np = self.st_model.encode(
+            embeddings_np = self.model.encode(
                 texts,
                 batch_size=64,
                 show_progress_bar=self.enable_tqdm,

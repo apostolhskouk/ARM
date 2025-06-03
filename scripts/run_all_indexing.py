@@ -1,15 +1,15 @@
 import os
-from src.retrieval.bm25 import PyseriniBM25Retriever
+#from src.retrieval.bm25 import PyseriniBM25Retriever
 from src.retrieval.dense import FaissDenseRetriever
 import time
-EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-l-v2.0"
+EMBEDDING_MODEL = "Alibaba-NLP/gte-multilingual-base"
 INPUT_FOLDER = "assets/all_data/serialized_data"
 OUTPUT_FOLDER_BM25 = "assets/all_data/indexes/bm25"
-OUTPUT_FOLDER_DENSE = "assets/all_data/indexes/dense_arctic_embed_l_v2"
+OUTPUT_FOLDER_DENSE = "assets/all_data/indexes/dense_alibaba_gte_multilingual"
 METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
 FIELD_TO_INDEX = "object"
 def main():
-    bm25_retriever = PyseriniBM25Retriever()
+    #bm25_retriever = PyseriniBM25Retriever()y
     dense_retriever = FaissDenseRetriever(EMBEDDING_MODEL)
     #iterate over all files in the input folder
     for file_name in os.listdir(INPUT_FOLDER):
@@ -19,7 +19,7 @@ def main():
         bm25_output_folder = os.path.join(OUTPUT_FOLDER_BM25, file_name)
         dense_output_folder = os.path.join(OUTPUT_FOLDER_DENSE, file_name)
         bm_25_time = time.time()
-        bm25_retriever.index(input_file_path, bm25_output_folder,FIELD_TO_INDEX,METADATA_FIELDS_TO_INDEX)
+        #bm25_retriever.index(input_file_path, bm25_output_folder,FIELD_TO_INDEX,METADATA_FIELDS_TO_INDEX)
         bm_25_time = time.time() - bm_25_time
         dense_time = time.time()
         dense_retriever.index(input_file_path, dense_output_folder, FIELD_TO_INDEX, METADATA_FIELDS_TO_INDEX)
