@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 from tqdm.auto import tqdm
 import faiss
 import torch
-from src.retrieval.base import BaseRetriever, RetrievalResult # Assuming this base class exists
+from src.retrieval.base import BaseRetriever, RetrievalResult 
 import numpy as np
 from vllm import LLM, SamplingParams
 from sentence_transformers import SentenceTransformer as ImportedSentenceTransformer
@@ -47,6 +47,11 @@ class FaissDenseRetriever(BaseRetriever):
                 tensor_parallel_size=self.num_gpus if self.num_gpus > 0 else 1,
                 task="embed",
                 enforce_eager=True,
+                dtype="float16",  # Use lower precision for better performance
+                tokenizer_pool_size=4,  # Increase tokenizer parallelism
+                max_num_batched_tokens=8192,  # Enable chunked prefill with larger batch size
+                gpu_memory_utilization=0.7,
+                max_model_len=8192,  # Set max model length to 8192
             )
             self.embedding_dim = self.vllm_model.llm_engine.model_config.get_hidden_size()
         elif self.selected_backend == "infinity":
