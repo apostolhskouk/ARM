@@ -18,12 +18,13 @@ We have curated a collection of benchmarks that include table-based, text-based,
 *   **[MT-RAIG](https://arxiv.org/abs/2502.11735)**: Designed to evaluate Retrieval-Augmented Insight Generation over multiple, unknown tables, moving beyond simple factoid QA.
 *   **[MultiHop-RAG](https://arxiv.org/abs/2401.15391)**: A benchmark focused on multi-hop queries, where systems must retrieve and reason over multiple text passages to find an answer.
 *   **[TableBench](https://arxiv.org/abs/2408.09174)**: A complex benchmark designed to mirror real-world industrial scenarios for table-based question answering.
-*   **[TARGET](https://arxiv.org/abs/2505.11545)**: A benchmark for evaluating TAble Retrieval for GEnerative Tasks, from which we adopt the format and the following datasets.
 *   **[BIRD](https://arxiv.org/pdf/2305.03111)**: A large-scale text-to-SQL benchmark that emphasizes challenges found in real-world databases, such as dirty data and the need for efficient SQL queries.
 *   **[FeTaQA](https://arxiv.org/abs/2104.00369)**: Features questions that require generating free-form, explanatory answers by integrating facts from multiple cells within a single table.
 *   **[OTT-QA](https://arxiv.org/abs/2010.10439)**: A large-scale benchmark for open-domain question answering over both tables and text, often requiring multi-hop reasoning across them.
 *   **[Spider](https://arxiv.org/abs/1809.08887)**: A large, complex, and cross-domain text-to-SQL dataset that tests a model's ability to generalize to new database schemas and SQL structures.
 *   **[TabFact](https://arxiv.org/abs/1909.02164)**: A large-scale dataset for fact verification where statements must be verified as entailed or refuted based on evidence from a given table.
+
+Note that the format and the pre-processing for the last 5 datasets was taken from **[TARGET](https://arxiv.org/abs/2505.11545)**.
 
 ### ⚙️ Data Serialization
 
