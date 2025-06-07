@@ -30,9 +30,10 @@ Note that the format and the pre-processing for the last 5 datasets was taken fr
 
 To create a unified retrieval corpus, all source documents were processed into a `jsonl` format where each line is a retrievable "object".
 
-*   **Tables**: After experimenting with multiple serialization strategies on the FEVEROUS benchmark, we found that a **row-by-row** format yielded the best performance. Each row is serialized as:
-    `"title [SEP] [H] colname1 : val1 , [H] colname2 : val2 ..."`
-*   **Text**: Text passages are serialized as:
+*   **Table Serialization**: We experimented with three strategies for serializing tables: as a **whole table**, **row-by-row**, and **value-by-value**. Based on experiments on the FEVEROUS benchmark, the **row-by-row** format proved most effective. Therefore, all tables in the corpus are serialized as individual rows using the format:
+    `"title if applicable [SEP] [H] colname1 : val1 , [H] colname2 : val2 ..."`
+
+*   **Text Serialization**: Text passages are serialized as:
     `"title [SEP] text_passage"`
     *For long documents like those in MultiHop-RAG, we performed semantic chunking using [chonky](https://github.com/mirth/chonky).*
 
@@ -41,7 +42,13 @@ Each `jsonl` record contains the following fields:
 *   `page_title`: The identifier for the broader document (e.g., database name, Wikipedia page title).
 *   `source`: The specific identifier within the document (e.g., `table_01`, `sentence_42`).
 
-The combination of `page_title` and `source` creates a **unique document ID**. While retrieval is performed on individual `objects` (e.g., table rows), evaluation is measured at the document level (unique IDs).
+### ⚠️ A Note on Retrieval vs. Evaluation Granularity
+
+It's important to note a key distinction in our process:
+*   **Retrieval is performed at the *object* level**: The system retrieves individual table rows or text chunks.
+*   **Evaluation is measured at the *document* level**: Success is determined by whether the correct unique document ID (e.g., the source table or article, identified by `page_title` + `source`) is retrieved.
+
+This creates a challenge: retrieving the top *k* objects might result in fewer than *k* unique documents, as multiple rows from the same table could be returned. Our evaluation scripts are designed to handle this by de-duplicating the document IDs post-retrieval before calculating metrics.
 
 ### 🎯 Query Set Creation
 
