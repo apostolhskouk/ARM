@@ -74,3 +74,94 @@ The resulting corpus files for retrieval are as follows:
 | `tabfact.jsonl`   | 5.3M        |
 | `ottqa.jsonl`     | 2.6M        |
 | `table_bench.jsonl` | 2.5M        |
+
+
+## 🚀 Retrievers
+
+We implement and evaluate a suite of retrieval methods, ranging from classic sparse and dense retrievers to advanced agentic and hybrid approaches.
+
+### 1. Sparse Retriever (BM25)
+
+We implement a sparse retriever using the **BM25** score function. Our implementation leverages [Pyserini](https://github.com/castorini/pyserini), a highly efficient Python wrapper for the Java-based Lucene search library.
+
+### 2. Dense Retriever
+
+For dense retrieval, we use a two-stage process:
+*   **Embedding Serving**: We use [Infinity](https://github.com/michaelfeil/infinity) to serve text embeddings via a high-throughput, low-latency REST API.
+*   **Vector Indexing**: Embeddings are indexed and searched using [FAISS](https://github.com/facebookresearch/faiss). The GPU-accelerated implementation offers extremely fast exhaustive search. For CPU-only environments, this can be switched to an approximate nearest neighbor method like HNSW.
+
+#### ✨ Embedding Model Benchmark
+
+We benchmarked several top-performing embedding models from the [MTEB Leaderboard](https://huggingface.co/spaces/mteb/leaderboard) (under 2B parameters) to find the best fit for our mixed-modality corpus.
+
+**Models Tested:**
+*   [Alibaba-NLP/gte-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-modernbert-base)
+*   [Alibaba-NLP/gte-multilingual-base](https://huggingface.co/Alibaba-NLP/gte-multilingual-base)
+*   [Snowflake/snowflake-arctic-embed-l-v2.0](https://huggingface.co/Snowflake/snowflake-arctic-embed-l-v2.0)
+*   [Snowflake/snowflake-arctic-embed-s](https://huggingface.co/Snowflake/snowflake-arctic-embed-s)
+*   [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3)
+*   [intfloat/multilingual-e5-large-instruct](https://huggingface.co/intfloat/multilingual-e5-large-instruct)
+*   [infly/inf-retriever-v1-1.5b](https://huggingface.co/infly/inf-retriever-v1-1.5b)
+*   [jinaai/jina-embeddings-v3](https://huggingface.co/jinaai/jina-embeddings-v3)
+*   [nomic-ai/nomic-embed-text-v2-moe](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe)
+*   [nomic-ai/modernbert-embed-base](https://huggingface.co/nomic-ai/modernbert-embed-base)
+*   [WhereIsAI/UAE-Large-V1](https://huggingface.co/WhereIsAI/UAE-Large-V1)
+*   [Qwen/Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+
+**Performance Results:**
+
+| Embedding Model                      | Recall@5 |
+| ------------------------------------ | -------- |
+| `inf-retriever-v1-1.5b`              | **0.769**  |
+| `bge-m3`                             | 0.763    |
+| `UAE-Large-V1`                       | 0.761    |
+| `Qwen/Qwen3-Embedding-0.6B`          | 0.753    |
+| `gte-modernbert-base`                | 0.749    |
+| `multilingual-e5-large-instruct`     | 0.747    |
+| `gte-multilingual-base`              | 0.744    |
+| `snowflake-arctic-embed-l-v2.0`      | 0.743    |
+| `nomic-embed-text-v2-moe`            | 0.727    |
+| `jina-embeddings-v3`                 | 0.715    |
+| `modernbert-embed-base`              | 0.707    |
+| `snowflake-arctic-embed-s`           | 0.664    |
+
+| Embedding Model                      | QPS (Queries/Sec) |
+| ------------------------------------ | ----------------- |
+| `snowflake-arctic-embed-s`           | 79.1              |
+| `modernbert-embed-base`              | 75.9              |
+| `jina-embeddings-v3`                 | 75.5              |
+| `gte-multilingual-base`              | 74.6              |
+| `snowflake-arctic-embed-l-v2.0`      | 72.2              |
+| `nomic-embed-text-v2-moe`            | 71.5              |
+| `bge-m3`                             | 66.9              |
+| `UAE-Large-V1`                       | 65.2              |
+| `multilingual-e5-large-instruct`     | 63.5              |
+| `Qwen/Qwen3-Embedding-0.6B`          | 62.1              |
+| `gte-modernbert-base`                | 61.9              |
+| `inf-retriever-v1-1.5b`              | 60.2              |
+
+Based on these results, we selected **`infly/inf-retriever-v1-1.5b`** for our dense retrieval stages. Despite being a larger model, it provides the best recall with a very reasonable QPS, offering a great balance between performance and speed.
+
+### 3. Dense Retriever with Reranker
+
+We enhance our dense retriever with a powerful cross-encoder reranker. We use [`mixedbread-ai/mxbai-rerank-large-v2`](https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v2), one of the top-performing models on reranking leaderboards, to re-score the top candidates from the dense retriever.
+
+### 4. Dense Retriever with Query Decomposition
+
+This retriever uses an LLM to decompose complex queries into simpler sub-queries, which are then executed individually.
+*   **LLM Serving**: We provide two implementations: one using [LangChain](https://www.langchain.com/) and [Ollama](https://ollama.com/) for smaller workloads, and a high-performance version using [vLLM](https://github.com/vllm-project/vllm) for large-scale inference.
+*   **Model**: We use few-shot prompting with [`google/gemma-3-27b-it`](https://huggingface.co/google/gemma-3-27b-it) as the base model for decomposition.
+
+We also implement a hybrid version that combines **Decomposition with the Reranker**.
+
+### 5. Agentic Retriever (ReAct)
+
+We implement a ReAct (Reasoning and Acting) agent, which iteratively reasons about the task and chooses an action (`Search` or 'Finish') to make progress. To ensure the LLM's output strictly follows the required format (`Search[keywords]` and 'Finish'), we use [guidance](https://github.com/guidance-ai/guidance) for constrained generation.
+
+### 6. ARM Retriever (Core Implementation)
+
+This is our implementation of the paper's core contribution. Its key components are:
+*   **Base Retrievers**: Utilizes the **BM25** and **Dense** retrievers described above as its foundation.
+*   **Constrained N-gram Generation**: We use the principles from **[RecLM-gen](https://arxiv.org/abs/2505.03336)**, a method for constrained generation in recommender systems for item recommendation that ensures an LLM only generates in-domain outputs. We adapt this to recommend valid n-grams from our corpus, with an underlying implementation based on the `transformers` library to support beam search.
+*   **Main Retrieval Loop**: The multi-step retrieval process is powered by **vLLM**. Its automatic KV caching is highly effective, as the prompt (containing few-shot examples and the history of previous steps) is efficiently reused across the generation steps for each query.
+*   **MIP Solver**: For the final Mixed Integer Programming (MIP) step that selects the optimal set of documents, we use [PuLP](https://github.com/coin-or/pulp) as the modeler. Our default solver is [Gurobi](https://www.gurobi.com/), known for its high performance.
