@@ -140,7 +140,7 @@ We benchmarked several top-performing embedding models from the [MTEB Leaderboar
 | `gte-modernbert-base`                | 61.9              |
 | `inf-retriever-v1-1.5b`              | 60.2              |
 
-Based on these results, we selected **`infly/inf-retriever-v1-1.5b`** for our dense retrieval stages. Despite being a larger model, it provides the best recall with a very reasonable QPS, offering a great balance between performance and speed.
+Based on these results, we selected **`BAAI/bge-m3`** for our dense retrieval stages. It provides high recall with a very reasonable QPS, offering a great balance between performance and speed.
 
 ### 3. Dense Retriever with Reranker
 
