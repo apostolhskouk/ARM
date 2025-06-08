@@ -167,3 +167,39 @@ This is our implementation of the paper's core contribution. Its key components 
 *   **MIP Solver**: For the final Mixed Integer Programming (MIP) step that selects the optimal set of documents, we use [PuLP](https://github.com/coin-or/pulp) as the modeler. Our default solver is [Gurobi](https://www.gurobi.com/), known for its high performance.
 *  **LLM models**: The main retrieval process with vLLM uses google/gemma-3-27b-it as its base model, while the constrained n-gram generation component leverages meta-llama/Meta-Llama-3.1-8B-Instruct, as the original RecLM-gen code was specifically designed to work with this model.
 
+
+## 🛠️ How to Reproduce Results
+
+This section shows the project's architecture and the core components for running retrieval and evaluation.
+
+### 📂 Project Structure
+
+The project has two main directories:
+
+*   `src/`: Contains the implementation for retrievers, evaluation, and utilities. Subdirectories group related code (e.g., `src/retrieval/`).
+*   `scripts/`: Contains scripts to run the pipeline steps like data processing, indexing, retrieval, and evaluation.
+
+### 🧩 Core Components
+
+The framework uses two base classes for a consistent structure.
+
+#### The Retriever Interface (`src/retrieval/base.py`)
+
+Located at `src/retrieval/base.py`, the `BaseRetriever` class acts as a blueprint for all retrievers. It ensures every retriever has two main functions:
+
+*   `index(...)`: Takes a corpus file and builds a searchable index.
+*   `retrieve(...)`: Takes queries and returns the top-k `RetrievalResult` objects, which contain the score, retrieved text, and metadata.
+
+This common interface allows any retriever to be swapped in and out of the pipeline easily.
+
+#### The Evaluation Framework (`src/evaluation/metrics.py`)
+
+Located at `src/evaluation/metrics.py`, the `EvaluationMetrics` class handles all performance scoring.
+
+*   **Metrics**: It computes **Precision**, **Recall**, **F1-Score**, and **Perfect Recall** at different `n` values (e.g., @5, @10).
+*   **Granularity**: It automatically handles the object-level vs. document-level evaluation by de-duplicating results before scoring.
+
+Usage is straightforward:
+1.  Instantiate the class: `evaluator = EvaluationMetrics(n_values=[5, 10, 20])`
+2.  Calculate scores: `results_df = evaluator.calculate_metrics(ground_truth, predictions)`
+3.  Plot results: `evaluator.visualize_results(results_df, title="BM25 Performance")`
