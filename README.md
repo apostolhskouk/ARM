@@ -25,6 +25,7 @@ We have curated a collection of benchmarks that include table-based, text-based,
 *   **[TabFact](https://arxiv.org/abs/1909.02164)**: A large-scale dataset for fact verification where statements must be verified as entailed or refuted based on evidence from a given table.
 
 > **Note**: the format and the pre-processing for the last 5 datasets was taken from **[TARGET](https://arxiv.org/abs/2505.11545)**.
+
 > **Note**: for the Spider dataset we try two serialization; one per row and one per schema. For BIRD since the per-row serialization, after some experiments, was proven to not work, because even when retiieving 2048 candidates per query (the max candidates faiss supports), at recall@5, 90% of the retrievals had less than 5 retrieved objects, meaning that from one table multiple rows where rerieved.
 
 ### ⚙️ Data Serialization
