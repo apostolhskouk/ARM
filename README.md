@@ -230,7 +230,7 @@ conda activate arm
 
 The data preparation process is resource-intensive and time-consuming. To make it easier to get started, we have pre-processed all the datasets and uploaded them to Hugging Face.
 
-> **Note**: The downloaded data includes the serialized corpora and benchmark query sets. It does **not** include the pre-built vector indexes for the embedding model comparison, as they require ~250GB of storage. If you wish to reproduce the embedding benchmark, you will need to run the indexing scripts yourself.
+> **Note**: The downloaded data includes the serialized corpora and benchmark query sets. It does **not** include the pre-built vector indexes for the embedding model comparison, since they are 12 different embedding indexes for the 9 different datasets, requiring ~250GB of storage. If you wish to reproduce the embedding benchmark, you will need to run the indexing scripts yourself as described below.
 
 To download the data, run the following command in your terminal:
 
@@ -238,4 +238,4 @@ To download the data, run the following command in your terminal:
 huggingface-cli download ApostolosK/arm_reproduction_data_processed --repo-type dataset --include "assets/*" --local-dir .
 ```
 
-This will download the data into the `assets/` directory. You can explore `assets/all_data/serialized_data` and `assets/all_data/benchmarks` to familiarize yourself with the data format.
+This will download the data into the `assets/` directory. You can explore `assets/all_data/serialized_data` and `assets/all_data/benchmarks` to familiarize yourself with the datasets and benchmarks format.
