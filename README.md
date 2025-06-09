@@ -217,13 +217,14 @@ git clone https://github.com/apostolhskouk/ARM.git
 cd ARM/
 ```
 
-### 2. Set Up the Conda Environment
+### 2. Set Up the Conda Environment and instal code in editable mode
 
 This project uses Conda to manage dependencies. Assuming you have Conda installed, create and activate the environment using the provided `environment.yml` file:
 
 ```bash
 conda env create -f environment.yml
 conda activate arm
+pip install -e .
 ```
 
 ### 3. Download the Pre-processed Data
