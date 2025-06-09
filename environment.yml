@@ -1,0 +1,70 @@
+# environment.yml
+# Defines the complete, working Conda environment.
+# Uses upgraded PyTorch and pins NumPy for stability.
+name: arm
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  # --- Core Conda Packages ---
+  - python=3.11
+  - libgcc-ng
+  - libstdcxx-ng
+  - libgomp
+  - openjdk=21
+  - maven
+  - pip
+  - bash
+  
+  # --- PyTorch and CUDA from Conda (Upgraded and Pinned) ---
+  - pytorch::pytorch=2.3.0
+  - pytorch::torchvision=0.18.0
+  - pytorch::torchaudio=2.3.0
+  - pytorch::pytorch-cuda=12.1
+
+  # --- Core Python Libraries from Conda (with NumPy pinned) ---
+  # Pinning NumPy to a stable 1.x version to avoid ABI conflicts with NumPy 2.x.
+  # Other libraries are pinned to versions compatible with numpy 1.26.4.
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.13.0
+  - scikit-learn=1.4.2
+  - matplotlib=3.8.2
+  - tqdm=4.67.1
+  - ipython=9.2.0
+  
+  # --- All Pip Packages (will respect the conda-installed numpy) ---
+  # These are now installed as part of the single environment creation step.
+  - pip:
+    - accelerate
+    - einops
+    - faiss-gpu-cu12
+    - flagembedding
+    - guidance
+    - langchain_core
+    - langchain_ollama
+    - megablocks
+    - mxbai_rerank
+    - pyserini
+    - qdrant_client
+    - safetensors
+    - sentence_transformers
+    - tokenizers
+    - transformers
+    - vllm
+    - xformers
+    - chonky
+    - marisa_trie
+    - nltk
+    - openpyxl
+    - pulp
+    - pydantic
+    - pyodbc
+    - resources
+    - semchunk
+    - target_benchmark
+    - usercustomize
+    - wandb
