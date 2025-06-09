@@ -8,12 +8,12 @@ from src.retrieval.dense_rerank import DenseRetrieverWithReranker
 from src.retrieval.dense_decomp import DenseRetrieverWithDecomposition
 from src.retrieval.dense_decomp_rerank import DenseRetrieverWithDecompositionAndReranker
 from src.feverous.feverous_evaluator import FeverousEvaluation
-
+import argparse
 from pathlib import Path
 import pandas as pd
 import wandb
 
-BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark_subsampled.json")
+BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark.json")
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
@@ -44,6 +44,14 @@ def get_output_folder(base_dir: Path, level: str, retriever_instance: BaseRetrie
         raise ValueError(f"Unknown retriever type {retriever_name}, cannot determine index path.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="(Optional) WandB entity name; defaults to your authenticated entity"
+    )
+    args = parser.parse_args()
     with open(BENCHMARK_FILE_PATH, 'r', encoding='utf-8') as f:
         benchmark_data = json.load(f) 
     all_nlqs = [record.get('claim') for record in benchmark_data if record.get('claim')]
@@ -82,7 +90,7 @@ if __name__ == "__main__":
             }
             run = wandb.init(
                 project="feverous-retrieval-benchmark-sample",
-                entity="lakhs",
+                entity=args.wandb_entity,
                 group=f"level-{index_level}",
                 name=f"run-{index_level}-{retriever_name}",
                 config=run_config,
