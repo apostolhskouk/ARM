@@ -168,7 +168,7 @@ This is our implementation of the paper's core contribution. Its key components 
 *  **LLM models**: The main retrieval process with vLLM uses google/gemma-3-27b-it as its base model, while the constrained n-gram generation component leverages meta-llama/Meta-Llama-3.1-8B-Instruct, as the original RecLM-gen code was specifically designed to work with this model.
 
 
-## 🛠️ How to Reproduce Results
+# 🛠️ How to Reproduce Results
 
 This section shows the project's architecture and the core components for running retrieval and evaluation.
 
@@ -203,3 +203,39 @@ Usage is straightforward:
 1.  Instantiate the class: `evaluator = EvaluationMetrics(n_values=[5, 10, 20])`
 2.  Calculate scores: `results_df = evaluator.calculate_metrics(ground_truth, predictions)`
 3.  Plot results: `evaluator.visualize_results(results_df, title="BM25 Performance")`
+
+## 🚀 Getting Started
+
+Follow these steps to set up the project environment and download the necessary data.
+
+### 1. Clone the Repository
+
+First, clone this repository and navigate into the project directory:
+
+```bash
+git clone https://github.com/apostolhskouk/ARM.git
+cd ARM/
+```
+
+### 2. Set Up the Conda Environment
+
+This project uses Conda to manage dependencies. Assuming you have Conda installed, create and activate the environment using the provided `environment.yml` file:
+
+```bash
+conda env create -f environment.yml
+conda activate arm
+```
+
+### 3. Download the Pre-processed Data
+
+The data preparation process is resource-intensive and time-consuming. To make it easier to get started, we have pre-processed all the datasets and uploaded them to Hugging Face.
+
+> **Note**: The downloaded data includes the serialized corpora and benchmark query sets. It does **not** include the pre-built vector indexes for the embedding model comparison, as they require ~250GB of storage. If you wish to reproduce the embedding benchmark, you will need to run the indexing scripts yourself.
+
+To download the data, run the following command in your terminal:
+
+```bash
+huggingface-cli download ApostolosK/arm_reproduction_data_processed --repo-type dataset --include "assets/*" --local-dir .
+```
+
+This will download the data into the `assets/` directory. You can explore `assets/all_data/serialized_data` and `assets/all_data/benchmarks` to familiarize yourself with the data format.
