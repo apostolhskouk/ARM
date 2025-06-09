@@ -240,3 +240,63 @@ huggingface-cli download ApostolosK/arm_reproduction_data_processed --repo-type 
 ```
 
 This will download the data into the `assets/` directory. You can explore `assets/all_data/serialized_data` and `assets/all_data/benchmarks` to familiarize yourself with the datasets and benchmarks format.
+
+## 🧪 Running the Experiments
+
+Once the environment is set up and the data is in place, you can run the experiments using the scripts in the `scripts/` directory.
+
+> **Note**: All evaluation scripts use [Weights & Biases](https://wandb.ai/) for logging. You must replace `your_entity` with your personal or team's wandb entity name for the scripts to run correctly.
+
+### 1. FEVEROUS Granularity Benchmark
+
+This script evaluates the impact of different table serialization methods (table vs. row vs. cell) on retrieval performance using the FEVEROUS dataset. The specific data files for this experiment are located in `assets/feverous/serialized_output/`.
+
+```bash
+python scripts/run_feverous_benchmark.py --wandb_entity your_entity
+```
+
+The script will automatically use existing indexes if they were downloaded or create them if they are missing.
+
+### 2. Embedding Model Comparison
+
+This two-step process benchmarks the performance of all selected embedding models across the datasets.
+
+**Step 2a: Indexing**
+
+First, build the indexes for each embedding model.
+
+```bash
+python scripts/run_embedding_indexing.py
+```
+
+⚠️ **Warning**: This step is extremely time-consuming and resource-intensive, as it builds a separate, large index for each of the 12 embedding models.
+
+**Step 2b: Evaluation**
+
+Once indexing is complete, run the evaluation.
+
+```bash
+python scripts/run_embedding_evaluation.py --wandb_entity your_entity
+```
+
+### 3. Full Evaluation Across All Datasets
+
+This is the main experiment to reproduce the final results, evaluating all retrieval methods across all benchmarks.
+
+**Step 3a: Indexing**
+
+First, ensure the necessary indexes for the primary retriever are built.
+
+```bash
+python scripts/run_all_indexing.py
+```
+
+If you downloaded the data from Hugging Face, this script will verify the files and finish quickly. Otherwise, it will build the required indexes.
+
+**Step 3b: Evaluation**
+
+Finally, run the main evaluation script. This will test all implemented retrievers (BM25, Dense, Reranker, Agentic, ARM, etc.) on all datasets.
+
+```bash
+python scripts/run_all_evaluation.py --wandb_entity your_entity
+```
