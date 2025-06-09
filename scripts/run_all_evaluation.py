@@ -1,3 +1,5 @@
+import os
+os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 import json
 import time
 import gc
@@ -31,9 +33,9 @@ RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
     #"BM25": PyseriniBM25Retriever,
     #"Dense": FaissDenseRetriever,
     #"DenseRerank": DenseRetrieverWithReranker,
-    #"DenseDecomp": DenseRetrieverWithDecomposition,
-    #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
-    "ARM": ARMRetriever,
+    "DenseDecomp": DenseRetrieverWithDecomposition,
+    "DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
+    #"ARM": ARMRetriever,
     #"ReAct": ReActRetriever,
     #"Colbert": PylateColbertRetriever,
 }
@@ -44,7 +46,7 @@ COLBERT_INDEX_BASE_DIR = Path("assets/all_data/indexes/colbert_reasoning")
 QWEN_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_qwen_3")
 ARM_INDEX_BASE_DIR = Path("assets/all_data/indexes/arm_retriever")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
-RETRIEVAL_K = 200
+RETRIEVAL_K = 30
 WANDB_PROJECT_NAME = "all_benchmarks"
 WANDB_ENTITY_NAME = "lakhs"
 
@@ -248,6 +250,7 @@ def main():
         
         del retriever_instance
         gc.collect()
+
 
 if __name__ == "__main__":
     main()
