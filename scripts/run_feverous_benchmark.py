@@ -17,7 +17,7 @@ BENCHMARK_FILE_PATH = Path("assets/feverous/benchmark.json")
 INDEX_BASE_DIR = Path("assets/feverous/")
 DATA_DIR = Path("assets/feverous/serialized_output")
 DECOMP_CACHE_DIR = INDEX_BASE_DIR / "decompositions_cache"
-INDEX_LEVELS_TO_RUN = ["row"]
+INDEX_LEVELS_TO_RUN = ["table", "row", "cell"]
 K_RESULTS = 30
 EVALUATION_N_VALUES = [1, 3, 5, 10] 
 SERIALIZATION_FILENAMES = {
@@ -68,9 +68,9 @@ if __name__ == "__main__":
         retriever_instances = {
             "BM25": lambda: PyseriniBM25Retriever(),
             "Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
-            "Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            "Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
+            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
         }
         for name, init_func in retriever_instances.items():
             retriever_instance = init_func()

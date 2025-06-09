@@ -1,15 +1,14 @@
-import abc
 import json
 import time
 import gc
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
+from typing import List,Tuple
 from pathlib import Path
 import pandas as pd
 import wandb
 from src.utils.evaluator import EvaluationMetrics
 from src.retrieval.dense import FaissDenseRetriever
 from src.retrieval.base import BaseRetriever, RetrievalResult
+import argparse
 
 # --- Constants ---
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
@@ -39,7 +38,7 @@ INDEXES_BASE_DIR_TEMPLATE = "assets/all_data/indexes/{embedding_folder_key}/"
 EVALUATION_N_VALUES = [1, 3, 5, 10]
 RETRIEVAL_K = 2048
 WANDB_PROJECT_NAME = "all_benchmarks_multi_embedding_dense"
-WANDB_ENTITY_NAME = "lakhs" 
+WANDB_ENTITY_NAME = "" 
 ACCURACY_METRIC_KEYS = ['Precision', 'Recall', 'F1', 'Perfect Recall']
 
 # --- Helper Functions ---
@@ -205,4 +204,13 @@ def main():
     print("WandB summary run complete.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=WANDB_ENTITY_NAME,
+        help="wandb entity name"
+    )
+    args = parser.parse_args()
+    WANDB_ENTITY_NAME = args.wandb_entity
     main()

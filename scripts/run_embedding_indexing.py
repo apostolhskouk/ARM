@@ -1,15 +1,5 @@
-import abc
-import json
 import time
-import gc
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
-from pathlib import Path
-import pandas as pd
-import wandb
-from src.utils.evaluator import EvaluationMetrics
 from src.retrieval.dense import FaissDenseRetriever
-from src.retrieval.base import BaseRetriever, RetrievalResult
 import os 
 from time import time
 INDEXES_BASE_DIR_TEMPLATE = "assets/all_data/indexes/{embedding_folder_key}/"

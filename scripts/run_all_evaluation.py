@@ -18,7 +18,7 @@ from src.retrieval.arm import ARMRetriever
 from src.retrieval.react import ReActRetriever
 from src.retrieval.colbert import PylateColbertRetriever
 from src.retrieval.QwenIndexer import QwenIndexer
-
+import argparse
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
 BENCHMARK_FILENAMES = [
     #"bird.json", 
@@ -48,7 +48,7 @@ ARM_INDEX_BASE_DIR = Path("assets/all_data/indexes/arm_retriever")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
 RETRIEVAL_K = 30
 WANDB_PROJECT_NAME = "all_benchmarks"
-WANDB_ENTITY_NAME = "lakhs"
+WANDB_ENTITY_NAME = ""
 
 DECOMPOSITION_MODEL_NAME = "gaunernst/gemma-3-27b-it-int4-awq"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
@@ -253,4 +253,13 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=WANDB_ENTITY_NAME,
+        help="wandb entity name"
+    )
+    args = parser.parse_args()
+    WANDB_ENTITY_NAME = args.wandb_entity
     main()

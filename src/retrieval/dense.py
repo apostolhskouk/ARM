@@ -17,7 +17,7 @@ class FaissDenseRetriever(BaseRetriever):
     METADATA_FILENAME = "metadata.pkl"
 
     def __init__(self,
-                 model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
+                 model_name_or_path: str = "BAAI/bge-m3",
                  enable_tqdm: bool = True,
                  use_vllm_indexing: bool = False,
                  use_infinity_indexing: bool = False):
