@@ -1,2 +1,0 @@
-[console_scripts]
-rec-lm-cgen-serve = cli_serve:main
