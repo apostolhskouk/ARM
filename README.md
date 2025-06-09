@@ -302,3 +302,201 @@ Finally, run the main evaluation script. This will test all implemented retrieve
 ```bash
 python scripts/run_all_evaluation.py --wandb_entity your_entity
 ```
+
+
+# 💻 Using on Your Own Corpus
+
+You can use the retrievers in this project on your own data. The general workflow is:
+
+1. **Prepare Data**: Create a `jsonl` file with your documents.
+2. **Choose & Configure a Retriever**: Select a retriever from the list below and instantiate it with your desired parameters.
+3. **Index & Retrieve**: Use the common `.index()` and `.retrieve()` methods to process your data and get results.
+
+### 1. Prepare Your Data
+
+First, prepare your corpus as a `jsonl` file where each line is a single JSON object. You can include as many fields as you need.
+
+> **Note**: There is no need to provide a unique ID field in your `jsonl` file. The underlying system automatically adds a unique identifier to each object internally.
+
+**Example `my_corpus.jsonl`:**
+```json
+{"doc_title": "Paper A", "content": "The first document is about sparse retrieval.", "year": 2020}
+{"doc_title": "Paper B", "content": "The second document covers dense retrieval methods.", "year": 2021}
+```
+
+### 2. Choose and Configure a Retriever
+
+#### BM25 Retriever
+
+**Example:**
+```python
+from src.retrieval.bm25 import PyseriniBM25Retriever
+retriever = PyseriniBM25Retriever()
+```
+
+#### Dense Retriever
+
+Uses vector embeddings for retrieval.
+
+**Key Parameters:**
+- `model_name_or_path`: The Hugging Face embedding model to use.
+- `use_vllm_indexing`: Flag to use vllm for faster embedding computation (not optimal but better than the default sentence-transformers)
+- `use_infinity_indexing`: Flag to use infinity_emb for the fastest embedding computation (default is sentence-transformers).
+
+**Example:**
+```python
+from src.retrieval.dense import FaissDenseRetriever
+retriever = FaissDenseRetriever(
+    model_name_or_path="infly/inf-retriever-v1-1.5b",
+    use_infinity_indexing=True
+)
+```
+
+⚠️ **Dependency Note**: For maximum efficiency, set `use_infinity_indexing=True`. However, infinity_emb requires transformers<4.48 while vllm requires transformers>=4.52. The imports are commented out in the source. To use infinity_emb, you must uncomment its import, downgrade transformers, run indexing, and then upgrade again. This is because vllm is needed for the ARM implementation and the query decomposition.
+
+#### Dense Retriever with Reranker
+
+Adds a cross-encoder reranking step.
+
+**Key Parameters:**
+- `embedding_model_name`: The embedding model for initial retrieval.
+- `reranker_model_name`: The Hugging Face reranker model.
+- `k_multiplier`: A multiplier for k to fetch enough candidates for the reranker to be effective (e.g., `k_multiplier=3` fetches 3*k items).
+
+**Example:**
+```python
+from src.retrieval.dense_rerank import DenseRetrieverWithReranker
+retriever = DenseRetrieverWithReranker(
+    embedding_model_name="infly/inf-retriever-v1-1.5b",
+    reranker_model_name="mixedbread-ai/mxbai-rerank-large-v2",
+    k_multiplier=3
+)
+```
+
+#### Dense Retriever with Query Decomposition
+
+Uses an LLM to break down complex queries.
+
+
+**Key Parameters:**
+- `embedding_model_name`: The embedding model.
+- `model_name`: The LLM for decomposition (via vllm or ollama).
+- `use_vllm`: Set to True to use the high-performance vLLM backend (default). To modify its behavior (e.g., prompts), edit `src/utils/query_decomposition_vllm.py`.
+- `decomposition_cache_folder`: Optional path to a folder where a `decomposition.json` file will be stored, mapping queries to their decompositions for future use.
+
+**Example:**
+```python
+from src.retrieval.dense_decomp import DenseRetrieverWithDecomposition
+retriever = DenseRetrieverWithDecomposition(
+    embedding_model_name="infly/inf-retriever-v1-1.5b",
+    model_name="gaunernst/gemma-3-27b-it-int4-awq",
+    use_vllm=True
+)
+```
+
+#### Dense Retriever with Decomposition and Reranker
+
+Combines the two previous methods.
+
+**Parameters:** A combination of the parameters from the Decomposition and Reranker retrievers.
+
+**Example:**
+```python
+from src.retrieval.dense_decomp_rerank import DenseRetrieverWithDecompositionAndReranker
+retriever = DenseRetrieverWithDecompositionAndReranker(
+    embedding_model_name="infly/inf-retriever-v1-1.5b",
+    reranker_model_name="mixedbread-ai/mxbai-rerank-large-v2",
+    model_name="gaunernst/gemma-3-27b-it-int4-awq"
+)
+```
+
+#### ReAct Retriever
+
+An agentic retriever that iteratively searches.
+
+**Key Parameters:**
+- `dense_model_name_or_path`: The embedding model for the Search tool.
+- `model_path`: Path to the agent's LLM. The implementation uses guidance with a llama-cpp-python backend for performance with GGUF models. To use standard Hugging Face models, the source code needs to be modified slightly.
+- `max_iterations`: The maximum number of search steps (default: 5).
+- `k_react_search`: Documents to retrieve per search step (default: 5).
+
+**Example:**
+```python
+from src.retrieval.react import ReActRetriever
+retriever = ReActRetriever(
+    dense_model_name_or_path="infly/inf-retriever-v1-1.5b",
+    model_path="Qwen2.5-32B-Instruct-Q4_K_M.gguf"
+)
+```
+
+#### ARM Retriever
+
+The core implementation of the paper's method.
+
+
+**Key Parameters:**
+- `vllm_model_path`: The main LLM for the retrieval loop (standard HF formats are best; GGUF is not optimized here).
+- `ngram_llm_model_path`: The LLM for constrained n-gram generation (implemented to work best with Llama models).
+- `embedding_model_name`: The dense embedding model.
+- `keyword_extraction_beams`: Number of beams for vLLM to use when extracting keywords from the query.
+- `corpus_ngram_min_len` / `corpus_ngram_max_len`: Min/max token length for n-grams used in alignment.
+- `keyword_rephrasing_beams`: Number of beams to generate keyword alignments.
+- `vllm_quantization`: Type of dynamic quantization for vLLM (e.g., fp8).
+- `alignment_retrieval_k`: Documents to retrieve for each generated n-gram using BM25
+- `compatibility_semantic_weight` / `compatibility_exact_weight`: Weights for semantic vs. lexical match in the MIP solver formulation.
+- `expansion_steps`: Number of neighbor expansion steps per retrieved object before feeding to MIP.
+- `expansion_k_compatible`: Compatible documents to fetch during each expansion step.
+- `mip_k_select`: Final number of documents to select via the MIP solver, which are then passed to the final LLM call.
+
+**Example:**
+```python
+from src.retrieval.arm import ARMRetriever
+retriever = ARMRetriever(
+    vllm_model_path="gaunernst/gemma-3-27b-it-int4-awq",
+    ngram_llm_model_path="meta-llama/Meta-Llama-3-8B",
+    embedding_model_name="infly/inf-retriever-v1-1.5b"
+)
+```
+
+### 3. Index and Retrieve
+
+Since all retriever classes implement the `BaseRetriever` interface from `src/retrieval/base.py`, the methods for indexing and retrieving are the same for all of them.
+
+#### Indexing Your Data
+
+The `.index()` method builds a searchable index from your jsonl file.
+
+```python
+# This works for any 'retriever' object created above
+retriever.index(
+    input_jsonl_path="path/to/my_corpus.jsonl",
+    output_folder="./my_index",
+    field_to_index="content",
+    metadata_fields=["doc_title", "year"] # filed from jsonl to be included
+)
+```
+
+For the `ARMRetriever`, `output_folder` must be a list of two paths: `["./bm25_index_path", "./faiss_index_path"]`.
+
+#### Retrieving Results
+
+The `.retrieve()` method queries the index and returns the top results. An error will occur if the index is not found at the specified path.
+
+```python
+# This also works for any indexed 'retriever'
+results = retriever.retrieve(
+    nlqs=["query about sparse retrieval", "another query"],
+    output_folder="./my_index",
+    k=10
+)
+```
+
+The `k` parameter is ignored by the `ReActRetriever` and `ARMRetriever`, as they use their own internal logic to determine the number of results to return.
+
+### 4. Understanding the Output
+
+The `.retrieve()` method returns a `List[List[RetrievalResult]]`, which is a list of result lists (one list for each query). Each `RetrievalResult` object corresponds to one retrieved object and contains:
+
+- `score` (float): The relevance score assigned by the retriever (this varies by method).
+- `object` (str): The retrieved text from the `field_to_index`.
+- `metadata` (dict): A dictionary containing the metadata fields and their values for the retrieved object.
