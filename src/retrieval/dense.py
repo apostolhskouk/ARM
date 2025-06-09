@@ -9,8 +9,8 @@ from src.retrieval.base import BaseRetriever, RetrievalResult
 import numpy as np
 from vllm import LLM, SamplingParams
 from sentence_transformers import SentenceTransformer as ImportedSentenceTransformer
-import asyncio
-from infinity_emb import AsyncEngineArray, EngineArgs
+#import asyncio
+#from infinity_emb import AsyncEngineArray, EngineArgs
 
 class FaissDenseRetriever(BaseRetriever):
     INDEX_FILENAME = "index.faiss"
@@ -20,7 +20,7 @@ class FaissDenseRetriever(BaseRetriever):
                  model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
                  enable_tqdm: bool = True,
                  use_vllm_indexing: bool = False,
-                 use_infinity_indexing: bool = True):
+                 use_infinity_indexing: bool = False):
 
         self.model_name_or_path = model_name_or_path
         self.enable_tqdm = enable_tqdm
@@ -29,9 +29,9 @@ class FaissDenseRetriever(BaseRetriever):
         self.num_gpus = torch.cuda.device_count()
 
         self.st_model = None
-        self.vllm_model = None
+        self.model = None
         self.vllm_sampling_params = None
-        self.infinity_engine_array: Optional[AsyncEngineArray] = None
+        #self.infinity_engine_array: Optional[AsyncEngineArray] = None
         self.embedding_dim: Optional[int] = None
 
         self.selected_backend = "sentence_transformer"
@@ -41,7 +41,7 @@ class FaissDenseRetriever(BaseRetriever):
             self.selected_backend = "infinity"
 
         if self.selected_backend == "vllm":
-            self.vllm_model = LLM(
+            self.model = LLM(
                 model=self.model_name_or_path,
                 trust_remote_code=True,
                 tensor_parallel_size=self.num_gpus if self.num_gpus > 0 else 1,
@@ -53,7 +53,7 @@ class FaissDenseRetriever(BaseRetriever):
                 gpu_memory_utilization=0.7,
                 max_model_len=8192,  # Set max model length to 8192
             )
-            self.embedding_dim = self.vllm_model.llm_engine.model_config.get_hidden_size()
+            self.embedding_dim = self.model.llm_engine.model_config.get_hidden_size()
         elif self.selected_backend == "infinity":
             engine_args = EngineArgs(
                 model_name_or_path=self.model_name_or_path
@@ -61,13 +61,25 @@ class FaissDenseRetriever(BaseRetriever):
             self.infinity_engine_array = AsyncEngineArray.from_args([engine_args])
             self.embedding_dim = None
         else:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.model = ImportedSentenceTransformer(
+            if self.num_gpus > 1:
+                device = 'cpu'
+            else:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if self.model_name_or_path == "Qwen/Qwen3-Embedding-0.6B" :
+                self.model = ImportedSentenceTransformer(
                 self.model_name_or_path,
                 device=device,
                 trust_remote_code=True,
-                cache_folder="assets/cache"
+                cache_folder="assets/cache",
+                revision="refs/pr/2"
             )
+            else:
+                self.model = ImportedSentenceTransformer(
+                    self.model_name_or_path,
+                    device=device,
+                    trust_remote_code=True,
+                    cache_folder="assets/cache"
+                )
             self.model.max_seq_length = 8192
             self.embedding_dim = self.model.get_sentence_embedding_dimension()
 
@@ -104,7 +116,7 @@ class FaissDenseRetriever(BaseRetriever):
         final_metadata_list = current_metadata_list
 
         if self.selected_backend == "vllm":
-            request_outputs = self.vllm_model.embed(texts,truncate_prompt_tokens=8192)
+            request_outputs = self.model.embed(texts,truncate_prompt_tokens=8192)
             processed_embeddings = []
             for i, output in enumerate(request_outputs):
                 processed_embeddings.append(output.outputs.embedding)
@@ -116,7 +128,7 @@ class FaissDenseRetriever(BaseRetriever):
                 await engine.astart()
                 all_raw_embeddings_list = []
                 if self.enable_tqdm and len(texts_to_embed) > 0:
-                    batch_size = 1024
+                    batch_size = 512
                     for i in tqdm(range(0, len(texts_to_embed), batch_size), desc="Embedding with Infinity"):
                         batch = texts_to_embed[i:i + batch_size]
                         batch_embeds, _ = await engine.embed(sentences=batch)
@@ -135,15 +147,31 @@ class FaissDenseRetriever(BaseRetriever):
                 embeddings_np = np.array([], dtype=np.float32)
 
         else:
-            embeddings_np = self.model.encode(
-                texts,
-                batch_size=64,
-                show_progress_bar=self.enable_tqdm,
-                convert_to_numpy=True,
-                normalize_embeddings=False,
-                truncation=True,
-            )
-
+            if self.num_gpus > 1:
+                print(f"--- Using {self.num_gpus} GPUs for indexing via sentence-transformers ---")
+                # Start the multi-process pool on all available CUDA devices
+                pool = self.model.start_multi_process_pool()
+                # Increase batch size for multi-gpu
+                effective_batch_size = 16 * self.num_gpus
+                embeddings_np = self.model.encode_multi_process(
+                    texts,
+                    pool=pool,
+                    batch_size=effective_batch_size,
+                    show_progress_bar=self.enable_tqdm,
+                    normalize_embeddings=False,
+                )
+                # Stop the process in the end
+                self.model.stop_multi_process_pool(pool)
+            else:
+                embeddings_np = self.model.encode(
+                    texts,
+                    batch_size=64,
+                    show_progress_bar=self.enable_tqdm,
+                    convert_to_numpy=True,
+                    normalize_embeddings=False,
+                    truncation=True
+                )
+                
         faiss.normalize_L2(embeddings_np)
         index = faiss.IndexFlatIP(self.embedding_dim)
         index.add(embeddings_np)

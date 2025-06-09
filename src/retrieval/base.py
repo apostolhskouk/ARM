@@ -1,7 +1,6 @@
 import abc
-import json
 from dataclasses import dataclass, field 
-from typing import List, Dict, Any
+from typing import List, Dict, Any,Union
 
 
 @dataclass
@@ -36,7 +35,7 @@ class BaseRetriever(abc.ABC):
     @abc.abstractmethod
     def index(self,
             input_jsonl_path: str,
-            output_folder: str,
+            output_folder: Union[str, List[str]],
             field_to_index: str,
             metadata_fields: List[str]) -> None:
         """
@@ -58,7 +57,7 @@ class BaseRetriever(abc.ABC):
     @abc.abstractmethod
     def retrieve(self,
                 nlqs: List[str],
-                output_folder: str, # Changed from index_folder to match index method arg name
+                output_folder: Union[str, List[str]],
                 k: int) -> List[List[RetrievalResult]]:
         """
         Retrieves the top-k relevant documents for a given natural language query.

@@ -10,7 +10,7 @@ import torch
 from tqdm.auto import tqdm
 
 import guidance
-from guidance import models, gen, select, user, system, assistant
+from guidance import models, gen, select, assistant
 import traceback 
 
 REACT_PROMPT_TEMPLATE = """Solve a question answering task with interleaving Thought, Action, Observation steps. A Thought step must be followed by a Action step, an Action step must be followed by an Observation step (unless Action is Finish), and an Observation step must be followed by a Thought step. Thought can reason about the current situation. Action can be of two types:
@@ -113,20 +113,9 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
     lm += f"\nUser question: {question}"
     with assistant():
         for i in range(1, max_rounds + 1):
-            prompt_for_thought_gen = str(lm) + f"\nThought:"
-            print(f"\n[VERBOSE] Round {i}: Input to Thought Generation:\n{prompt_for_thought_gen}")
             lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0.2,max_tokens=5000)}'
-            generated_thought = lm.get(f"thought_{i}")
-            print(f"[VERBOSE] Round {i}: Output of Thought Generation:\n{generated_thought}")
-            prompt_for_action_type_gen = str(lm) + f"\nAction:"
-            print(f"\n[VERBOSE] Round {i}: Input to Action Type Generation:\n{prompt_for_action_type_gen}")
-            
-            lm += f'\nAction: {select(["Search", "Finish"], name=f"act_{i}")}'
-            prompt_for_action_arg_gen = str(lm) + f"["
-            print(f"\n[VERBOSE] Round {i}: Input to Action Argument Generation:\n{prompt_for_action_arg_gen}")
+            lm += f'\nAction: {select(["    ", "Finish"], name=f"act_{i}")}'
             lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=5000, temperature=0.0)}]'
-            generated_action_arg = lm.get(f"arg_{i}")
-            print(f"[VERBOSE] Round {i}: Output of Action Argument Generation:\n{generated_action_arg}")
             current_act = lm.get(f'act_{i}')
             current_arg = lm.get(f'arg_{i}')
 
@@ -217,18 +206,14 @@ class ReActRetriever(FaissDenseRetriever):
             print(f"Error: LLM model path '{self.model_path}' not found or not specified.")
             self.guidance_lm = None
             return
+        self.guidance_lm = models.LlamaCpp(
+            self.model_path,
+            n_gpu_layers=-1,
+            n_ctx=self.llm_n_ctx,
+            repeat_penalty=1.2,
+            echo=False
+        )
 
-        try:
-            self.guidance_lm = models.LlamaCpp(
-                self.model_path,
-                n_gpu_layers=-1,
-                n_ctx=self.llm_n_ctx,
-                repeat_penalty=1.2,
-                echo=False
-            )
-        except Exception as e:
-            print(f"Error initializing Guidance LLM: {e}")
-            self.guidance_lm = None
 
 
     def _format_observation(self, results: List[RetrievalResult]) -> str:
@@ -286,16 +271,12 @@ class ReActRetriever(FaissDenseRetriever):
             return [[] for _ in nlqs]
 
         # --- Load FAISS index and metadata ONCE ---
-        try:
-            index_cpu = faiss.read_index(index_path)
-            with open(metadata_path, 'rb') as f:
-                doc_metadata_list: List[Dict[str, Any]] = pickle.load(f)
-            num_docs_in_index = index_cpu.ntotal # Use ntotal attribute for count
-            if num_docs_in_index != len(doc_metadata_list):
-                 print("Warning: FAISS index size and metadata list length differ!")
-        except Exception as e:
-            print(f"Error loading FAISS index or metadata: {e}")
-            return [[] for _ in nlqs]
+        index_cpu = faiss.read_index(index_path)
+        with open(metadata_path, 'rb') as f:
+            doc_metadata_list: List[Dict[str, Any]] = pickle.load(f)
+        num_docs_in_index = index_cpu.ntotal # Use ntotal attribute for count
+        if num_docs_in_index != len(doc_metadata_list):
+                print("Warning: FAISS index size and metadata list length differ!")
 
         # --- FAISS Index Resource Management (GPU or CPU) ---
         res = None
@@ -341,63 +322,55 @@ class ReActRetriever(FaissDenseRetriever):
 
             search_calls_increment = 1 # We are performing a search now
 
-            try:
-                # 1. Encode the query
-                query_embedding = self.model.encode(
-                    [keywords.strip()],
-                    convert_to_numpy=True,
-                    normalize_embeddings=True # Ensure normalization if model expects it
-                )
+            # 1. Encode the query
+            query_embedding = self.model.encode(
+                [keywords.strip()],
+                convert_to_numpy=True,
+                normalize_embeddings=True # Ensure normalization if model expects it
+            )
 
-                # 2. Search the FAISS index
-                step_scores, step_indices = index_to_search.search(query_embedding, self.k_react_search)
+            # 2. Search the FAISS index
+            step_scores, step_indices = index_to_search.search(query_embedding, self.k_react_search)
 
-                step_results: List[RetrievalResult] = []
-                # Indices and scores are nested (list of lists), take the first element for the single query
-                query_indices = step_indices[0]
-                query_scores = step_scores[0]
+            step_results: List[RetrievalResult] = []
+            # Indices and scores are nested (list of lists), take the first element for the single query
+            query_indices = step_indices[0]
+            query_scores = step_scores[0]
 
-                # 3. Process results
-                for rank, doc_idx in enumerate(query_indices):
-                    # FAISS can return -1 for invalid indices
-                    if doc_idx < 0 or doc_idx >= num_docs_in_index:
-                        print(f"Warning: Invalid doc_idx {doc_idx} received from FAISS search. Skipping.")
-                        continue
-                    # Basic check for score length mismatch
-                    if rank >= len(query_scores):
-                        print(f"Warning: Score index out of bounds for rank {rank}, doc_idx {doc_idx}. Skipping.")
-                        continue
+            # 3. Process results
+            for rank, doc_idx in enumerate(query_indices):
+                # FAISS can return -1 for invalid indices
+                if doc_idx < 0 or doc_idx >= num_docs_in_index:
+                    print(f"Warning: Invalid doc_idx {doc_idx} received from FAISS search. Skipping.")
+                    continue
+                # Basic check for score length mismatch
+                if rank >= len(query_scores):
+                    print(f"Warning: Score index out of bounds for rank {rank}, doc_idx {doc_idx}. Skipping.")
+                    continue
 
-                    meta = doc_metadata_list[doc_idx]
-                    # Ensure '_text' exists and is a non-empty string (or adapt if your key is different)
-                    text_key = '_text' # Or use self.field_to_index if that's passed/stored
-                    text = meta.get(text_key)
-                    if not isinstance(text, str) or not text.strip():
-                        print(f"Warning: Skipping doc_idx {doc_idx} due to invalid or empty text content (key: '{text_key}').")
-                        continue
+                meta = doc_metadata_list[doc_idx]
+                # Ensure '_text' exists and is a non-empty string (or adapt if your key is different)
+                text_key = '_text' # Or use self.field_to_index if that's passed/stored
+                text = meta.get(text_key)
+                if not isinstance(text, str) or not text.strip():
+                    print(f"Warning: Skipping doc_idx {doc_idx} due to invalid or empty text content (key: '{text_key}').")
+                    continue
 
-                    # Create metadata dict excluding the indexed text field
-                    extra_meta = {k_meta: v_meta for k_meta, v_meta in meta.items() if k_meta != text_key}
-                    score = float(query_scores[rank]) # Ensure score is float
+                # Create metadata dict excluding the indexed text field
+                extra_meta = {k_meta: v_meta for k_meta, v_meta in meta.items() if k_meta != text_key}
+                score = float(query_scores[rank]) # Ensure score is float
 
-                    # Create the result object (ensure it's hashable)
-                    result = RetrievalResult(score=score, object=text, metadata=extra_meta)
+                # Create the result object (ensure it's hashable)
+                result = RetrievalResult(score=score, object=text, metadata=extra_meta)
 
-                    # Add to step results and the overall collected set for the query
-                    step_results.append(result)
-                    current_collected_results_set.add(result) # Add unique results
+                # Add to step results and the overall collected set for the query
+                step_results.append(result)
+                current_collected_results_set.add(result) # Add unique results
 
-                # 4. Format the observation for the LLM
-                observation_string = self._format_observation(step_results)
-                return observation_string, search_calls_increment
+            # 4. Format the observation for the LLM
+            observation_string = self._format_observation(step_results)
+            return observation_string, search_calls_increment
 
-            except faiss.FaissException as fe:
-                 print(f"!!! FAISS Error during search for keywords '{keywords}': {fe}")
-                 return "Observation: A FAISS error occurred during the search process.", search_calls_increment # Return 0 calls if search failed
-            except Exception as e:
-                print(f"!!! Error during search execution for keywords '{keywords}': {e}")
-                traceback.print_exc() # Print full traceback for debugging
-                return "Observation: An error occurred during the search process.", search_calls_increment # Return 0 calls if search failed
         # --- End search step function definition ---
 
 
@@ -419,36 +392,25 @@ class ReActRetriever(FaissDenseRetriever):
                 return obs
             # --- End search function closure ---
 
-            try:
-                executed_state = self.guidance_lm + react_guidance_program(
-                    # lm is implicitly handled by the '+' operator
+            executed_state = self.guidance_lm + react_guidance_program(
+                # lm is implicitly handled by the '+' operator
+                question=nlq,
+                max_rounds=self.max_iterations,
+                search_func=bound_search_func_with_counter,
+                initial_prompt=REACT_PROMPT_TEMPLATE
+            )
+
+            if isinstance(executed_state, Callable) and not hasattr(executed_state, 'variables'):
+                program_definition = react_guidance_program # Get the function object
+
+                    # Execute the program definition by calling it with the LLM and args
+                executed_state = program_definition(
+                    lm=self.guidance_lm,
                     question=nlq,
                     max_rounds=self.max_iterations,
                     search_func=bound_search_func_with_counter,
                     initial_prompt=REACT_PROMPT_TEMPLATE
                 )
-
-                if isinstance(executed_state, Callable) and not hasattr(executed_state, 'variables'):
-                    program_definition = react_guidance_program # Get the function object
-
-                     # Execute the program definition by calling it with the LLM and args
-                    executed_state = program_definition(
-                        lm=self.guidance_lm,
-                        question=nlq,
-                        max_rounds=self.max_iterations,
-                        search_func=bound_search_func_with_counter,
-                        initial_prompt=REACT_PROMPT_TEMPLATE
-                    )
-
-            except Exception as e:
-                traceback.print_exc() # Print the full traceback
-
-                # Append empty results and log metrics even on failure
-                all_final_results.append([])
-                self.distinct_retrieved_counts_per_query.append(0)
-                # Log calls made *before* the error occurred
-                self.llm_search_calls_per_query.append(search_call_counter['count'])
-                continue # Skip to the next query
 
             # --- Store results and metrics for the successfully processed query ---
             # Append collected results (unique across all search steps for this query)
