@@ -19,6 +19,7 @@ BENCHMARK_FILENAMES = [
     "table_bench.json"
 ]
 
+
 EMBEDDING_MODELS_CONFIG = {
   "Alibaba-NLP/gte-modernbert-base": "dense_alibaba_gte_modernbert",
   "Alibaba-NLP/gte-multilingual-base": "dense_alibaba_gte_multilingual",
@@ -30,12 +31,13 @@ EMBEDDING_MODELS_CONFIG = {
   "jinaai/jina-embeddings-v3": "dense_jina_v3",
   "nomic-ai/nomic-embed-text-v2-moe": "dense_nomic_embed_text_v2_moe",
   "nomic-ai/modernbert-embed-base": "dense_nomic_modernbert",
-  "WhereIsAI/UAE-Large-V1": "dense_uae_large_v1"
+  "WhereIsAI/UAE-Large-V1": "dense_uae_large_v1",
+  "Qwen/Qwen3-Embedding-0.6B": "dense_qwen_3",
 }
 INDEXES_BASE_DIR_TEMPLATE = "assets/all_data/indexes/{embedding_folder_key}/"
 
 EVALUATION_N_VALUES = [1, 3, 5, 10]
-RETRIEVAL_K = 9000
+RETRIEVAL_K = 2048
 WANDB_PROJECT_NAME = "all_benchmarks_multi_embedding_dense"
 WANDB_ENTITY_NAME = "lakhs" 
 ACCURACY_METRIC_KEYS = ['Precision', 'Recall', 'F1', 'Perfect Recall']
@@ -111,18 +113,15 @@ def main():
             num_queries = len(queries)
 
             start_time = time.time()
-            retrieval_k = RETRIEVAL_K
-            if benchmark_filename == "bird.json":
-                retrieval_k = retrieval_k * 10
             retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
                 nlqs=queries,
                 output_folder=str(index_folder),
-                k=retrieval_k
+                k=RETRIEVAL_K
             )
             end_time = time.time()
             retrieval_time = end_time - start_time
             qps = num_queries / retrieval_time if retrieval_time > 0 else 0
-            
+                
             wandb.log({
                 "retrieval_time_seconds": retrieval_time,
                 "queries_per_second": qps

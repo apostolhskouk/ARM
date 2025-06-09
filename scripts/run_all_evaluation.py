@@ -12,45 +12,60 @@ from src.retrieval.dense import FaissDenseRetriever
 from src.retrieval.dense_rerank import DenseRetrieverWithReranker
 from src.retrieval.dense_decomp import DenseRetrieverWithDecomposition
 from src.retrieval.dense_decomp_rerank import DenseRetrieverWithDecompositionAndReranker
-from src.retrieval.arm_beam import ARMRetriever
+from src.retrieval.arm import ARMRetriever
 from src.retrieval.react import ReActRetriever
+from src.retrieval.colbert import PylateColbertRetriever
+from src.retrieval.QwenIndexer import QwenIndexer
 
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
 BENCHMARK_FILENAMES = [
-    "bird.json", "fetaqa.json", "feverous.json", "mt_raig.json",
+    #"bird.json", 
+    "fetaqa.json", "feverous.json", "mt_raig.json",
     "multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
     "table_bench.json"
 ]
+METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
+FIELD_TO_INDEX = "object"
 
 RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
     #"BM25": PyseriniBM25Retriever,
-    "Dense": FaissDenseRetriever,
+    #"Dense": FaissDenseRetriever,
     #"DenseRerank": DenseRetrieverWithReranker,
     #"DenseDecomp": DenseRetrieverWithDecomposition,
     #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
-    #"ARM": ARMRetriever,
+    "ARM": ARMRetriever,
     #"ReAct": ReActRetriever,
+    #"Colbert": PylateColbertRetriever,
 }
 
 BM25_INDEX_BASE_DIR = Path("assets/all_data/indexes/bm25/")
-DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_artic_embed_s")
+DENSE_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_bge_m3")
+COLBERT_INDEX_BASE_DIR = Path("assets/all_data/indexes/colbert_reasoning")
+QWEN_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_qwen_3")
+ARM_INDEX_BASE_DIR = Path("assets/all_data/indexes/arm_retriever")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
-RETRIEVAL_K = 50
+RETRIEVAL_K = 200
 WANDB_PROJECT_NAME = "all_benchmarks"
 WANDB_ENTITY_NAME = "lakhs"
 
 DECOMPOSITION_MODEL_NAME = "gaunernst/gemma-3-27b-it-int4-awq"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
-EMBEDDING_MODEL_INF_RETRIEVER = "Snowflake/snowflake-arctic-embed-s"
+EMBEDDING_MODEL = "BAAI/bge-m3"
 REACT_LLM_MODEL_PATH = "assets/cache/gemma-3-27b-it.Q4_K_M.gguf"
 ARM_VLLM_MODEL_PATH = "gaunernst/gemma-3-27b-it-int4-awq"
 ARM_NGRAM_LLM_MODEL_PATH = "meta-llama/Meta-Llama-3-8B-Instruct"
-
+SERIALIZED_DATA_DIR = "assets/all_data/serialized_data"
 
 def get_benchmark_file_stem(benchmark_filename: str) -> str:
     return Path(benchmark_filename).stem
 
 def get_index_folder_for_retrieval(retriever_name: str, benchmark_stem: str) -> Path:
+    if retriever_name == "Colbert":
+        return COLBERT_INDEX_BASE_DIR / benchmark_stem
+    if retriever_name == "QwenIndexer":
+        return QWEN_INDEX_BASE_DIR / benchmark_stem
+    if retriever_name == "ARM":
+        return ARM_INDEX_BASE_DIR / benchmark_stem
     is_bm25 = retriever_name == "BM25"
     base_path = BM25_INDEX_BASE_DIR if is_bm25 else DENSE_INDEX_BASE_DIR
     return base_path / benchmark_stem
@@ -70,36 +85,38 @@ def main():
         if retriever_name == "BM25":
             retriever_instance = RetrieverClass()
         elif retriever_name == "Dense":
-            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER,use_infinity_indexing=False)
+            retriever_instance = RetrieverClass(EMBEDDING_MODEL)
         elif retriever_name == "DenseRerank":
-            retriever_instance = RetrieverClass(EMBEDDING_MODEL_INF_RETRIEVER)
+            retriever_instance = RetrieverClass(EMBEDDING_MODEL)
         elif retriever_name == "DenseDecomp":
             retriever_instance = RetrieverClass(
-                embedding_model_name=EMBEDDING_MODEL_INF_RETRIEVER,
+                embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
                 decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
             )
         elif retriever_name == "DenseDecompRerank":
             retriever_instance = RetrieverClass(
-                embedding_model_name=EMBEDDING_MODEL_INF_RETRIEVER,
+                embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
                 decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
             )
         elif retriever_name == "ReAct":
             retriever_instance = RetrieverClass(
-                dense_model_name_or_path=EMBEDDING_MODEL_INF_RETRIEVER,
+                dense_model_name_or_path=EMBEDDING_MODEL,
                 model_path=REACT_LLM_MODEL_PATH
             )
         elif retriever_name == "ARM":
             retriever_instance = RetrieverClass(
                 vllm_model_path=ARM_VLLM_MODEL_PATH,
-                faiss_index_path=str(DENSE_INDEX_BASE_DIR),
-                bm25_index_path=str(BM25_INDEX_BASE_DIR),
                 ngram_llm_model_path=ARM_NGRAM_LLM_MODEL_PATH,
+                embedding_model_name=EMBEDDING_MODEL,
                 vllm_tensor_parallel_size=1,
                 expansion_steps=0
             )
-        
+        elif retriever_name == "Colbert":
+            retriever_instance = RetrieverClass()
+        elif retriever_name == "QwenIndexer":
+            retriever_instance = RetrieverClass()
         is_agentic_retriever = isinstance(retriever_instance, (ARMRetriever, ReActRetriever))
 
         for benchmark_filename in BENCHMARK_FILENAMES:
@@ -117,7 +134,7 @@ def main():
                 "retrieval_k_passed_to_method": RETRIEVAL_K,
                 "wandb_project": WANDB_PROJECT_NAME,
                 "wandb_entity": WANDB_ENTITY_NAME,
-                "embedding_model (if_applicable)": EMBEDDING_MODEL_INF_RETRIEVER if retriever_name not in ["BM25"] else "N/A",
+                "embedding_model (if_applicable)": EMBEDDING_MODEL if retriever_name not in ["BM25"] else "N/A",
                 "decomposition_llm (if_applicable)": DECOMPOSITION_MODEL_NAME if "Decomp" in retriever_name else "N/A",
                 "react_llm (if_applicable)": REACT_LLM_MODEL_PATH if retriever_name == "ReAct" else "N/A",
                 "arm_vllm (if_applicable)": ARM_VLLM_MODEL_PATH if retriever_name == "ARM" else "N/A",
@@ -137,13 +154,29 @@ def main():
             index_folder_for_retrieval = get_index_folder_for_retrieval(retriever_name, benchmark_stem)
             queries, ground_truth_ids_list = load_benchmark_data(benchmark_filepath)
             num_queries = len(queries)
-
             start_time = time.time()
-            retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
-                nlqs=queries,
-                output_folder=str(index_folder_for_retrieval),
-                k=RETRIEVAL_K
-            )
+            if retriever_name == "ARM":
+                dense_folder = get_index_folder_for_retrieval("Dense", benchmark_stem)
+                bm25_folder = get_index_folder_for_retrieval("BM25", benchmark_stem)
+                output_folder = [str(bm25_folder), str(dense_folder)]
+                serialized_data_path = Path(SERIALIZED_DATA_DIR) / f"{benchmark_stem}.jsonl"
+                retriever_instance.index(
+                    input_jsonl_path=serialized_data_path,
+                    output_folder=output_folder,
+                    field_to_index=FIELD_TO_INDEX,
+                    metadata_fields=METADATA_FIELDS_TO_INDEX
+                )
+                retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
+                    nlqs=queries,
+                    output_folder=output_folder,
+                    k=RETRIEVAL_K
+                )
+            else:
+                retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
+                    nlqs=queries,
+                    output_folder=str(index_folder_for_retrieval),
+                    k=RETRIEVAL_K
+                )
             end_time = time.time()
             retrieval_time = end_time - start_time
             

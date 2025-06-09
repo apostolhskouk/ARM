@@ -44,8 +44,6 @@ def main():
                 document_id = f"{page_title}_{lookup_key}" # lookup_key is already "table_{table_id}"
                 document_ids_for_record.append(document_id)
             else:
-                # Optionally handle cases where page_title is not found for a source
-                # For now, we just skip adding it
                 pass
 
         output_record = {

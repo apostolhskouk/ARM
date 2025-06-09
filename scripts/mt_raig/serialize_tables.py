@@ -5,7 +5,7 @@ def serialize_tables_by_row(input_json_path, output_json_path):
         tables_data = json.load(f)
 
     output_dir = os.path.dirname(output_json_path)
-    if output_dir and not os.path.exists(output_dir): # Ensure output_dir is not empty before checking existence
+    if output_dir and not os.path.exists(output_dir): 
         os.makedirs(output_dir)
 
     with open(output_json_path, 'w', encoding='utf-8') as outfile:
@@ -22,7 +22,6 @@ def serialize_tables_by_row(input_json_path, output_json_path):
 
             for row_cell_values in cells:
                 if len(row_cell_values) != len(header_list):
-                    # Optionally print a warning or log this mismatch
                     continue 
 
                 object_parts = []

@@ -16,7 +16,7 @@ splitter = ParagraphSplitter(
 )
 
 output_dir = os.path.dirname(output_file_path)
-if output_dir and not os.path.exists(output_dir): # Ensure output_dir is not empty
+if output_dir and not os.path.exists(output_dir): 
     os.makedirs(output_dir)
 
 with open(input_file_path, 'r', encoding='utf-8') as f_in, \
@@ -26,7 +26,6 @@ with open(input_file_path, 'r', encoding='utf-8') as f_in, \
 
     for record in tqdm(data, desc="Processing records", unit="record"):
         input_record_title = record.get("title", "")
-        # category = record.get("category", "") # Not used in the new output format
         input_record_source = record.get("source", "")
         
         text_to_chunk = record.get(original_text_field_name, "")

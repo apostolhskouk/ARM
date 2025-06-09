@@ -79,8 +79,7 @@ def main():
         all_serialized_records_for_dataset = []
         
         # NeedleInHaystackDataLoader might not have queries, but we are processing corpus here.
-        # It should still allow corpus iteration.
-        if loader.corpus is None and not isinstance(loader, NeedleInHaystackDataLoader): # NIH might have no queries but should have corpus
+        if loader.corpus is None and not isinstance(loader, NeedleInHaystackDataLoader): 
              print(f"  Corpus for {dataset_name_key} is None. Skipping corpus processing.")
         else:
             for batch in loader.convert_corpus_table_to(output_format="nested array", batch_size=1):
@@ -102,7 +101,6 @@ def main():
                                          context.get('section_title') or \
                                          context.get('title') # Adding generic title from context
                 
-                # For Text2SQL, original_table_id is often the table name
                 if not table_display_name and isinstance(config_model, Text2SQLDatasetConfigDataModel):
                     table_display_name = str(original_table_id)
 

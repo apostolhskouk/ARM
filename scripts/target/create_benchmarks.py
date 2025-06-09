@@ -4,7 +4,7 @@ from pathlib import Path
 benchmark_output_dir = Path("assets/target/benchmarks")
 benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 
-raw_data_dir = Path("assets/target_raw") # Same as previous script
+raw_data_dir = Path("assets/target_raw") 
 raw_data_dir.mkdir(parents=True, exist_ok=True)
 os.environ['HF_HOME'] = str(raw_data_dir.resolve())
 os.environ['HF_DATASETS_CACHE'] = str((raw_data_dir.resolve() / "datasets"))
@@ -12,7 +12,6 @@ os.environ['HF_HUB_CACHE'] = str((raw_data_dir.resolve() / "hub"))
 from target_benchmark.dataset_loaders import (
     HFDatasetLoader,
     Text2SQLDatasetLoader,
-    NeedleInHaystackDataLoader, # To identify and skip
 )
 from target_benchmark.dataset_loaders.LoadersDataModels import (
     HFDatasetConfigDataModel,
@@ -25,7 +24,6 @@ from target_benchmark.dataset_loaders.TargetDatasetConfig import (
     TEXT_2_SQL_DATASETS,
     NEEDLE_IN_HAYSTACK_DATASETS,
     DEFAULT_INFAGENTDA_DATASET_CONFIG,
-    DEFAULT_DUMMY_DATASET_CONFIG, # For testing if needed
 )
 from target_benchmark.dictionary_keys import (
     QUERY_ID_COL_NAME,
@@ -43,7 +41,6 @@ def main():
     ALL_DATASET_CONFIGS.update(TEXT_2_SQL_DATASETS)
     ALL_DATASET_CONFIGS.update(NEEDLE_IN_HAYSTACK_DATASETS)
     ALL_DATASET_CONFIGS[DEFAULT_INFAGENTDA_DATASET_CONFIG.dataset_name] = DEFAULT_INFAGENTDA_DATASET_CONFIG
-    # ALL_DATASET_CONFIGS[DEFAULT_DUMMY_DATASET_CONFIG.dataset_name] = DEFAULT_DUMMY_DATASET_CONFIG # Include if you want to test with dummy
 
     for dataset_name_key, config_model in ALL_DATASET_CONFIGS.items():
         print(f"Processing queries for dataset: {dataset_name_key}...")
@@ -67,13 +64,7 @@ def main():
             print("-" * 30)
             continue
         
-        try:
-            loader.load() # This loads both corpus and queries if paths are set
-        except Exception as e:
-            print(f"  Error loading dataset {dataset_name_key}: {e}")
-            print(f"  Skipping benchmark creation for {dataset_name_key}.")
-            print("-" * 30)
-            continue
+        loader.load() # This loads both corpus and queries if paths are set
 
         if loader.queries is None:
             print(f"  Queries for {dataset_name_key} could not be loaded. Skipping benchmark creation.")

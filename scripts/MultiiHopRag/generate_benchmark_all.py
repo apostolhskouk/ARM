@@ -18,17 +18,14 @@ def main():
         for evidence_item in evidence_list:
             source = evidence_item.get("source", "")
             title = evidence_item.get("title", "")
-            
-            # Replace spaces and other problematic characters in title if needed for a cleaner ID
-            # For now, direct concatenation as per "{source}_sentence_{title}"
-            # If title can be very long or contain many special chars, a hashing or slugify approach might be better
-            # but sticking to the literal interpretation of the format string.
+            title = title.replace(" ", "_").replace(".", "_")  # Simple slugification
+
             document_id = f"{source}_sentence_{title}"
             document_ids_for_record.append(document_id)
 
         output_record = {
             "query": query_text,
-            "document_ids": document_ids_for_record # Duplicates are preserved if present in source data construction
+            "document_ids": document_ids_for_record 
         }
         output_data_list.append(output_record)
         

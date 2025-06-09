@@ -1,23 +1,6 @@
 import json
 import os
 
-#INPUT_JSON_PATH = "assets/target/benchmarks/bird-validation_benchmark.json"
-#OUTPUT_JSON_PATH = "assets/all_data/benchmarks/bird.json"
-
-
-#INPUT_JSON_PATH = "assets/target/benchmarks/fetaqa_benchmark.json"
-#OUTPUT_JSON_PATH = "assets/all_data/benchmarks/fetaqa.json"
-
-#INPUT_JSON_PATH = "assets/target/benchmarks/ottqa_benchmark.json"
-#OUTPUT_JSON_PATH = "assets/all_data/benchmarks/ottqa.json"
-
-
-#INPUT_JSON_PATH = "assets/target/benchmarks/spider-test_benchmark.json"
-#OUTPUT_JSON_PATH = "assets/all_data/benchmarks/spider.json"
-
-#INPUT_JSON_PATH = "assets/target/benchmarks/tabfact_benchmark.json"
-#OUTPUT_JSON_PATH = "assets/all_data/benchmarks/tabfact.json"
-
 ALL_INPUT_JSON_PATHS = [
     "assets/target/benchmarks/bird-validation_benchmark.json",
     "assets/target/benchmarks/fetaqa_benchmark.json",
