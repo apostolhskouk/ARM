@@ -243,6 +243,14 @@ huggingface-cli download ApostolosK/arm_reproduction_data_processed --repo-type 
 
 This will download the data into the `assets/` directory. You can explore `assets/all_data/serialized_data` and `assets/all_data/benchmarks` to familiarize yourself with the datasets and benchmarks format.
 
+### 4. Download the huggingface model for the ReAct implementation
+
+The implementation of the ReAct agent is based on guidance with Transformers, however you need to pre-download the model. For our experiments we use Qwen2.5-32B-Instruct, since this was the easiest modern model to setup around 30B parameters. To download it as expected by the scripts you can run :
+
+```bash
+huggingface-cli download Qwen/Qwen2.5-32B-Instruct-AWQ --local-dir assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ --local-dir-use-symlinks False
+```
+
 ## 🧪 Running the Experiments
 
 Once the environment is set up and the data is in place, you can run the experiments using the scripts in the `scripts/` directory.
@@ -416,7 +424,7 @@ An agentic retriever that iteratively searches.
 
 **Key Parameters:**
 - `dense_model_name_or_path`: The embedding model for the Search tool.
-- `model_path`: Path to the agent's LLM. The implementation uses guidance with a llama-cpp-python backend for performance with GGUF models. To use standard Hugging Face models, the source code needs to be modified slightly.
+- `model_path`: Path to the agent's LLM. The implementation uses models from huggingface,however they need to be pre-downloaded, as the guidancelibrary doesnt fetch them by default.
 - `max_iterations`: The maximum number of search steps (default: 5).
 - `k_react_search`: Documents to retrieve per search step (default: 5).
 
