@@ -8,13 +8,13 @@ channels:
 
 dependencies:
   - python=3.11
-  - libgcc-ng
-  - libstdcxx-ng
-  - libgomp
-  - openjdk=21
-  - maven
-  - pip
-  - bash
+  - libgcc-ng=15.1.0
+  - libstdcxx-ng=15.1.0
+  - libgomp=15.1.0
+  - openjdk=21.0.6
+  - maven=3.9.10
+  - pip=25.1.1
+  - bash=5.2.37
   
   - pytorch::pytorch-cuda=12.1=ha16c6d3_6
   - pytorch::pytorch-mutex=1.0=cuda
@@ -27,37 +27,37 @@ dependencies:
   - ipython=9.2.0
   
   - pip:
-    - accelerate
-    - autoawq
-    - bitsandbytes
-    - einops
-    - faiss-gpu-cu12
-    - flagembedding
-    - gpustat
-    - guidance
-    - langchain_core
-    - langchain_ollama
-    - megablocks
-    - mxbai_rerank
-    - pyserini
-    - qdrant_client
-    - safetensors
-    - sentence_transformers
-    - tokenizers
+    - accelerate==1.7.0
+    - autoawq==0.2.9
+    - bitsandbytes==0.46.0
+    - chonky==0.1.6
+    - einops==0.8.1
+    - faiss-gpu-cu12==1.11.0
+    - flagembedding==1.3.5
+    - gpustat==1.1.1
+    - guidance==0.2.1
+    - langchain_core==0.3.64
+    - langchain_ollama==0.3.3
+    - megablocks==0.10.0
+    - mxbai-rerank==0.1.6
+    - pyserini==1.0.0
+    - qdrant_client==1.14.2
+    - safetensors==0.5.3
+    - sentence_transformers==4.1.0
+    - tokenizers==0.21.1
     - torchvision==0.22.0
     - torchaudio==2.7.0
-    - transformers
-    - vllm
-    - xformers
-    - chonky
-    - marisa_trie
-    - nltk
-    - openpyxl
-    - pulp
-    - pydantic
-    - pyodbc
-    - resources
-    - semchunk
-    - target_benchmark
-    - usercustomize
-    - wandb
+    - transformers==4.52.4
+    - vllm==0.9.0.1
+    - xformers==0.0.30
+    - marisa_trie==1.2.1
+    - nltk==3.9.1
+    - openpyxl==3.1.5
+    - pulp==3.2.1
+    - pydantic==2.11.5
+    - pyodbc==5.2.0
+    - resources==0.0.1
+    - semchunk==3.2.2
+    - target_benchmark==0.1.1
+    - usercustomize==1.0.0
+    - wandb==0.20.1
