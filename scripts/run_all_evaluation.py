@@ -1,5 +1,6 @@
 import os
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+os.environ['WANDB_DISABLE_CODE'] = 'true'
 import json
 import time
 import gc
@@ -16,27 +17,29 @@ from src.retrieval.dense_decomp import DenseRetrieverWithDecomposition
 from src.retrieval.dense_decomp_rerank import DenseRetrieverWithDecompositionAndReranker
 from src.retrieval.arm import ARMRetriever
 from src.retrieval.react import ReActRetriever
-from src.retrieval.colbert import PylateColbertRetriever
-from src.retrieval.QwenIndexer import QwenIndexer
+#from src.retrieval.colbert import PylateColbertRetriever
 import argparse
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
 BENCHMARK_FILENAMES = [
     #"bird.json", 
-    "fetaqa.json", "feverous.json", "mt_raig.json",
+    "fetaqa.json", 
+    "feverous.json", 
+    "mt_raig.json",
     "multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
-    "table_bench.json"
+    "table_bench.json",
+    "bird_schema.json", "spider_schema.json"
 ]
 METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
 FIELD_TO_INDEX = "object"
 
 RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
-    #"BM25": PyseriniBM25Retriever,
-    #"Dense": FaissDenseRetriever,
-    #"DenseRerank": DenseRetrieverWithReranker,
+    "BM25": PyseriniBM25Retriever,
+    "Dense": FaissDenseRetriever,
+    "DenseRerank": DenseRetrieverWithReranker,
     "DenseDecomp": DenseRetrieverWithDecomposition,
     "DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
-    #"ARM": ARMRetriever,
-    #"ReAct": ReActRetriever,
+    "ARM": ARMRetriever,
+    "ReAct": ReActRetriever,
     #"Colbert": PylateColbertRetriever,
 }
 
@@ -53,7 +56,7 @@ WANDB_ENTITY_NAME = ""
 DECOMPOSITION_MODEL_NAME = "gaunernst/gemma-3-27b-it-int4-awq"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
 EMBEDDING_MODEL = "BAAI/bge-m3"
-REACT_LLM_MODEL_PATH = "assets/cache/gemma-3-27b-it.Q4_K_M.gguf"
+REACT_LLM_MODEL_PATH = "assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ"
 ARM_VLLM_MODEL_PATH = "gaunernst/gemma-3-27b-it-int4-awq"
 ARM_NGRAM_LLM_MODEL_PATH = "meta-llama/Meta-Llama-3-8B-Instruct"
 SERIALIZED_DATA_DIR = "assets/all_data/serialized_data"
@@ -174,10 +177,14 @@ def main():
                     k=RETRIEVAL_K
                 )
             else:
+                k_temp = RETRIEVAL_K
+                if benchmark_stem.endswith("_schema"):
+                    # one object per table, so we can use max k
+                    k_temp = max(EVALUATION_N_VALUES)
                 retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
                     nlqs=queries,
                     output_folder=str(index_folder_for_retrieval),
-                    k=RETRIEVAL_K
+                    k=k_temp
                 )
             end_time = time.time()
             retrieval_time = end_time - start_time

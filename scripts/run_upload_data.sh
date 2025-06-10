@@ -18,6 +18,7 @@ PATHS_TO_UPLOAD=(
     "assets/all_data/indexes/bm25"
     "assets/feverous/faiss_indexes"
     "assets/feverous/pyserini_indexes"
+    "assets/arm"
 )
 # --- End of Configuration ---
 

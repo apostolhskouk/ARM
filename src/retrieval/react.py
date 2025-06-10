@@ -113,8 +113,8 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
     lm += f"\nUser question: {question}"
     with assistant():
         for i in range(1, max_rounds + 1):
-            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0.2,max_tokens=5000)}'
-            lm += f'\nAction: {select(["    ", "Finish"], name=f"act_{i}")}'
+            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0,max_tokens=5000)}'
+            lm += f'\nAction: {select(["Search", "Finish"], name=f"act_{i}")}'
             lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=5000, temperature=0.0)}]'
             current_act = lm.get(f'act_{i}')
             current_arg = lm.get(f'arg_{i}')
@@ -170,7 +170,7 @@ class ReActRetriever(FaissDenseRetriever):
     """
     def __init__(self,
                  dense_model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
-                 model_path: str = "assets/cache/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+                 model_path: str = "unsloth/gemma-3-27b-it-bnb-4bit",
                  max_iterations: int = 5,
                  k_react_search: int = 5,
                  llm_n_ctx: int = 32768,
@@ -206,13 +206,19 @@ class ReActRetriever(FaissDenseRetriever):
             print(f"Error: LLM model path '{self.model_path}' not found or not specified.")
             self.guidance_lm = None
             return
-        self.guidance_lm = models.LlamaCpp(
+        self.guidance_lm = models.Transformers(
             self.model_path,
-            n_gpu_layers=-1,
-            n_ctx=self.llm_n_ctx,
-            repeat_penalty=1.2,
+            torch_dtype=torch.float16,
+            device_map="auto",
             echo=False
         )
+        #self.guidance_lm = models.LlamaCpp(
+        #    self.model_path,
+        #    n_gpu_layers=-1,
+        #    n_ctx=self.llm_n_ctx,
+        #    repeat_penalty=1.2,
+        #    echo=False
+        #)
 
 
 

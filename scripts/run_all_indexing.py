@@ -23,8 +23,6 @@ def main():
         expansion_steps=0
     )
     for file_name in os.listdir(INPUT_FOLDER):
-        if file_name == "bird.jsonl":
-            continue
         print(f"Processing file: {file_name}")
         input_file_path = os.path.join(INPUT_FOLDER, file_name)
         file_name = file_name.split('.')[0]

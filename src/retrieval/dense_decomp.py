@@ -13,7 +13,7 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
     def __init__(
         self,
         embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
-        model_name: str = "llama3.1:8b",
+        model_name: str = "gaunernst/gemma-3-27b-it-int4-awq",
         decomposition_cache_folder: Optional[str] = None,
         use_vllm: bool = True
     ):
@@ -26,6 +26,7 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
             )
         else:
             self.decomposer = VLLMQueryDecomposer(
+                model_name_or_path=model_name,
                 output_folder=decomposition_cache_folder
             )
 

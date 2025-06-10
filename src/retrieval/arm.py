@@ -29,13 +29,13 @@ class ARMRetriever(BaseRetriever):
     def __init__(self,
                 vllm_model_path: str,
                 ngram_llm_model_path :str,
-                embedding_model_name: str = "WhereIsAI/UAE-Large-V1",
+                embedding_model_name: str = "BAAI/bge-m3",
                 keyword_extraction_beams: int = 5,
                 mip_k_select: int = 50,
                 compatibility_semantic_weight: float = 0.5,
                 compatibility_exact_weight: float = 0.5,
-                corpus_ngram_min_len: int = 1, # Renamed from trie_min_n_for_extraction
-                corpus_ngram_max_len: int = 3, # Renamed from trie_max_n_for_extraction
+                corpus_ngram_min_len: int = 1, 
+                corpus_ngram_max_len: int = 3, 
                 generate_n_grams:bool = True,
                 expansion_k_compatible: int = 3,
                 expansion_steps: int = 1,
@@ -46,7 +46,7 @@ class ARMRetriever(BaseRetriever):
                 filter_ngrams_against_corpus: bool = True,
                 arm_cache_dir: str = "assets/arm/",
                 keywords_per_query: int = 10,
-                alignment_retrieval_k: int = 5,
+                alignment_retrieval_k: int = 20,
                 ) -> None:
 
         self.embedding_model_name = embedding_model_name

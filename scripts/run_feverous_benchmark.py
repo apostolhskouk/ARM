@@ -27,7 +27,7 @@ SERIALIZATION_FILENAMES = {
 }
 METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
 FIELD_TO_INDEX = "object"
-REACT_LLM_MODEL_PATH = "assets/cache/Qwen2.5-32B-Instruct-Q4_K_M.gguf" 
+REACT_LLM_MODEL_PATH = "/data/hdd1/users/akouk/ARM/ARM/assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ" 
 EMBEDDING_MODEL_NAME = "WhereIsAI/UAE-Large-V1"
 RERANKER_MODEL_NAME = "mixedbread-ai/mxbai-rerank-base-v2"
 OLLAMA_MODEL = "llama3.1:8b"
@@ -68,9 +68,9 @@ if __name__ == "__main__":
         retriever_instances = {
             "BM25": lambda: PyseriniBM25Retriever(),
             "Dense": lambda: FaissDenseRetriever(model_name_or_path=EMBEDDING_MODEL_NAME),
-            #"Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
-            #"Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
-            #"Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            "Dense+Rerank": lambda: DenseRetrieverWithReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME),
+            "Dense+Decomp": lambda: DenseRetrieverWithDecomposition(embedding_model_name=EMBEDDING_MODEL_NAME, model_name=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
+            "Dense+Decomp+Rerank": lambda: DenseRetrieverWithDecompositionAndReranker(embedding_model_name=EMBEDDING_MODEL_NAME, reranker_model_name=RERANKER_MODEL_NAME, ollama_model=OLLAMA_MODEL, decomposition_cache_folder=str(DECOMP_CACHE_DIR)),
         }
         for name, init_func in retriever_instances.items():
             retriever_instance = init_func()
