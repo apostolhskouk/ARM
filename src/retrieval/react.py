@@ -113,9 +113,9 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
     lm += f"\nUser question: {question}"
     with assistant():
         for i in range(1, max_rounds + 1):
-            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0,max_tokens=5000)}'
+            lm += f'\nThought: {gen(name=f"thought_{i}", stop="Action:", temperature=0.2,max_tokens=512)}'
             lm += f'\nAction: {select(["Search", "Finish"], name=f"act_{i}")}'
-            lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=5000, temperature=0.0)}]'
+            lm += f'[{gen(name=f"arg_{i}", stop="]", max_tokens=128, temperature=0.2)}]'
             current_act = lm.get(f'act_{i}')
             current_arg = lm.get(f'arg_{i}')
 
@@ -124,7 +124,6 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
                 break
             elif current_act == 'Search' and current_arg is not None and current_arg.strip():
                 search_query_to_print = current_arg.strip()
-                print(f"ReAct Step {i} - Search Query: {search_query_to_print}")
                 try:
                     observation = search_func(search_query_to_print)
                 except Exception as e:
