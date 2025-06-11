@@ -1,4 +1,4 @@
-import json
+from time import time
 import os
 import pickle
 from typing import List, Dict, Any, Set, Tuple, Callable
@@ -18,6 +18,7 @@ REACT_PROMPT_TEMPLATE = """Solve a question answering task with interleaving Tho
 (2) Finish[answer], which returns the final answer and finishes the task.
 
 Important: Your primary goal is to find documents that directly answer the question. Continue using the Search action, possibly multiple times with refined keywords, until you have retrieved observations that contain the necessary information. The final answer provided in the Finish action must be explicitly derived from the content of these observations. Do not stop searching prematurely if the current observations are insufficient, ambiguous, or do not directly lead to the answer. It is acceptable to retrieve some irrelevant documents as long as you eventually find the ones that support the answer. Ensure your reasoning in the Thought step clearly justifies why the retrieved information is sufficient before using Finish.
+It is really important to retrieve the sufficient documents, so make sure you are using many Search actions, its okay if you oeverdo it, but do not miss them.
 
 Here are some examples:
 
@@ -222,28 +223,22 @@ class ReActRetriever(FaissDenseRetriever):
 
 
     def _format_observation(self, results: List[RetrievalResult]) -> str:
-        """Formats retrieval results into an observation string for the LLM."""
         if not results:
-            return "No relevant documents found." # More informative than just "No documents found."
+            return "No relevant documents found."
 
-        obs_str = ""
+        obs_parts = []
         for res in results:
-            # Use get with default values for safety
             page_title = res.metadata.get('page_title', 'Unknown Page')
             source = res.metadata.get('source', 'Unknown Source')
-            content = getattr(res, 'object', 'No Content') # Use getattr for safety
+            content = getattr(res, 'object', 'No Content')
+            content = str(content) if not isinstance(content, str) else content
 
-            # Ensure content is a string before adding
-            if not isinstance(content, str):
-                content = str(content) # Convert if not string
+            part = (f"page_title: {page_title}\n"
+                    f"source: {source}\n"
+                    f"object: {page_title} [SEP] {content.strip()}")
+            obs_parts.append(part)
 
-            # Format consistent with the examples in REACT_PROMPT_TEMPLATE
-            obs_str += f"page_title: {page_title}\n"
-            obs_str += f"source: {source}\n"
-            obs_str += f"object: {page_title} [SEP] {content.strip()}\n---\n"
-
-        # Strip final separator and whitespace
-        return obs_str.strip().strip('---').strip()
+        return "\n".join(obs_parts)
 
 
     def retrieve(self,
@@ -335,8 +330,9 @@ class ReActRetriever(FaissDenseRetriever):
             )
 
             # 2. Search the FAISS index
+            start_time = time()
             step_scores, step_indices = index_to_search.search(query_embedding, self.k_react_search)
-
+            print(f"FAISS search completed in {time() - start_time:.2f} seconds.",flush=True)
             step_results: List[RetrievalResult] = []
             # Indices and scores are nested (list of lists), take the first element for the single query
             query_indices = step_indices[0]
@@ -405,28 +401,16 @@ class ReActRetriever(FaissDenseRetriever):
                 initial_prompt=REACT_PROMPT_TEMPLATE
             )
 
-            if isinstance(executed_state, Callable) and not hasattr(executed_state, 'variables'):
-                program_definition = react_guidance_program # Get the function object
-
-                    # Execute the program definition by calling it with the LLM and args
-                executed_state = program_definition(
-                    lm=self.guidance_lm,
-                    question=nlq,
-                    max_rounds=self.max_iterations,
-                    search_func=bound_search_func_with_counter,
-                    initial_prompt=REACT_PROMPT_TEMPLATE
-                )
-
             # --- Store results and metrics for the successfully processed query ---
             # Append collected results (unique across all search steps for this query)
             all_final_results.append(list(collected_results_this_query))
             self.distinct_retrieved_counts_per_query.append(len(collected_results_this_query))
             # Log the total search calls made for this query
+            print(collected_results_this_query,flush=True)
             self.llm_search_calls_per_query.append(search_call_counter['count'])
 
         return all_final_results
 
-    # --- display_metrics remains the same ---
     def display_metrics(self, verbose=True) -> Tuple[float, float]:
         """Prints the collected metrics per query and their averages."""
         avg_distinct = 0.0

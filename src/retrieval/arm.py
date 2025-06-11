@@ -30,23 +30,23 @@ class ARMRetriever(BaseRetriever):
                 vllm_model_path: str,
                 ngram_llm_model_path :str,
                 embedding_model_name: str = "BAAI/bge-m3",
-                keyword_extraction_beams: int = 5,
-                mip_k_select: int = 50,
-                compatibility_semantic_weight: float = 0.5,
-                compatibility_exact_weight: float = 0.5,
+                keyword_extraction_beams: int = 3,
+                mip_k_select: int = 30,
+                compatibility_semantic_weight: float = 0.7,
+                compatibility_exact_weight: float = 0.3,
                 corpus_ngram_min_len: int = 1, 
                 corpus_ngram_max_len: int = 3, 
                 generate_n_grams:bool = True,
                 expansion_k_compatible: int = 3,
                 expansion_steps: int = 1,
-                keyword_rephrasing_beams: int = 1,
+                keyword_rephrasing_beams: int = 3,
                 vllm_tensor_parallel_size: int = 2,
                 vllm_cache_dir: str = "/data/hdd1/vllm_models/",
                 vllm_quantization: Optional[str] = None,
                 filter_ngrams_against_corpus: bool = True,
                 arm_cache_dir: str = "assets/arm/",
-                keywords_per_query: int = 10,
-                alignment_retrieval_k: int = 20,
+                keywords_per_query: int = 20,
+                alignment_retrieval_k: int = 5,
                 ) -> None:
 
         self.embedding_model_name = embedding_model_name
@@ -464,7 +464,7 @@ class ARMRetriever(BaseRetriever):
         retrieved_docs_by_faiss = self.faiss_dense_retriever.retrieve(
             nlqs=[user_query], 
             output_folder=self.faiss_index_path, 
-            k=self.alignment_retrieval_k * 2
+            k=self.alignment_retrieval_k * 4
         )
         all_bm25_results_flat: List[RetrievalResult] = [item for sublist in retrieved_docs_by_bm25_nested for item in sublist]
         faiss_results_for_query: List[RetrievalResult] = retrieved_docs_by_faiss[0] if retrieved_docs_by_faiss else []

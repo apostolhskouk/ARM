@@ -22,24 +22,24 @@ import argparse
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
 BENCHMARK_FILENAMES = [
     #"bird.json", 
-    "fetaqa.json", 
+    #"fetaqa.json", 
     "feverous.json", 
-    "mt_raig.json",
-    "multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
-    "table_bench.json",
-    "bird_schema.json", "spider_schema.json"
+    #"mt_raig.json",
+    #"multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
+    #"table_bench.json",
+    #"bird_schema.json", "spider_schema.json"
 ]
 METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
 FIELD_TO_INDEX = "object"
 
 RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
-    "BM25": PyseriniBM25Retriever,
-    "Dense": FaissDenseRetriever,
-    "DenseRerank": DenseRetrieverWithReranker,
-    "DenseDecomp": DenseRetrieverWithDecomposition,
-    "DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
+    #"BM25": PyseriniBM25Retriever,
+    #"Dense": FaissDenseRetriever,
+    #"DenseRerank": DenseRetrieverWithReranker,
+    #"DenseDecomp": DenseRetrieverWithDecomposition,
+    #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
     "ARM": ARMRetriever,
-    "ReAct": ReActRetriever,
+    #"ReAct": ReActRetriever,
     #"Colbert": PylateColbertRetriever,
 }
 
@@ -49,11 +49,11 @@ COLBERT_INDEX_BASE_DIR = Path("assets/all_data/indexes/colbert_reasoning")
 QWEN_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_qwen_3")
 ARM_INDEX_BASE_DIR = Path("assets/all_data/indexes/arm_retriever")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
-RETRIEVAL_K = 30
+RETRIEVAL_K = 300
 WANDB_PROJECT_NAME = "all_benchmarks"
 WANDB_ENTITY_NAME = ""
 
-DECOMPOSITION_MODEL_NAME = "gaunernst/gemma-3-27b-it-int4-awq"
+DECOMPOSITION_MODEL_NAME = "gemma3:1b"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 REACT_LLM_MODEL_PATH = "assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ"
@@ -97,13 +97,15 @@ def main():
             retriever_instance = RetrieverClass(
                 embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
-                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
+                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER,
+                use_vllm=False
             )
         elif retriever_name == "DenseDecompRerank":
             retriever_instance = RetrieverClass(
                 embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
-                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER
+                decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER,
+                use_vllm=False
             )
         elif retriever_name == "ReAct":
             retriever_instance = RetrieverClass(
@@ -129,7 +131,7 @@ def main():
             benchmark_filepath = BENCHMARK_DIR / benchmark_filename
 
             run_name = f"{retriever_name}-{benchmark_stem}"
-            group_name = f"retriever-{retriever_name}"
+            group_name = f"retriever-{retriever_name}-100"
             
             config_dict = {
                 "retriever_name": retriever_name,
@@ -205,13 +207,11 @@ def main():
                     f"agentic_avg_distinct_retrieved_objects": avg_distinct,
                     f"agentic_avg_llm_search_calls": avg_calls
                 })
-
-                k_for_eval = max(1, int(round(avg_distinct)))
                 
                 metrics_at_k_for_eval = evaluator.calculate_metrics_for_single_n(
                     ground_truth_ids=ground_truth_ids_list,
                     predicted_ids=predicted_doc_ids_list,
-                    n_value=k_for_eval
+                    n_value=RETRIEVAL_K*2
                 )
 
                 agentic_summary_df_data = {
@@ -221,7 +221,7 @@ def main():
                     "R @avg_obj": [metrics_at_k_for_eval.get("Recall", 0.0) * 100.0],
                     "F1 @avg_obj": [metrics_at_k_for_eval.get("F1", 0.0) * 100.0],
                     "PR @avg_obj": [metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0],
-                    "k_for_eval": [k_for_eval]
+                    "k_for_eval": [RETRIEVAL_K*2]
                 }
                 agentic_summary_df = pd.DataFrame(agentic_summary_df_data)
                 
@@ -232,7 +232,7 @@ def main():
                     f"agentic_{benchmark_stem}_R_at_avg_obj": metrics_at_k_for_eval.get("Recall", 0.0) * 100.0,
                     f"agentic_{benchmark_stem}_F1_at_avg_obj": metrics_at_k_for_eval.get("F1", 0.0) * 100.0,
                     f"agentic_{benchmark_stem}_PR_at_avg_obj": metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0,
-                    f"agentic_{benchmark_stem}_k_for_eval": k_for_eval,
+                    f"agentic_{benchmark_stem}_k_for_eval": RETRIEVAL_K*2,
                 })
 
             else:

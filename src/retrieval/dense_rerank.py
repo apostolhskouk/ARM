@@ -17,7 +17,7 @@ class DenseRetrieverWithReranker(FaissDenseRetriever):
         k_multiplier: int = 3
     ):
         super().__init__(model_name_or_path=embedding_model_name,)
-        self.reranker = MxbaiRerankV2(reranker_model_name,device_map="cuda:1" )
+        self.reranker = MxbaiRerankV2(reranker_model_name,device_map="cuda:1")
         self._reranker_model_name = reranker_model_name
         self._k_multiplier = k_multiplier
 

@@ -10,4 +10,4 @@ if __name__ == "__main__":
         if filename.endswith(".json"):
             input_path = os.path.join(input_folder, filename)
             output_path = os.path.join(output_folder, filename)
-            subsample_json(input_path, "query", output_path, k=500, skip_field="document_ids")
+            subsample_json(input_path, "query", output_path, k=100, skip_field="document_ids")

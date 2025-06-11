@@ -164,7 +164,6 @@ Respond ONLY with the list of sub-questions, each on a new line. Do NOT include 
         if self.decompositions_cache is not None:
             cached_result = self.get_cached_decompositions(nlq)
             if cached_result:
-                
                 return cached_result
 
         decomposed_queries = []
