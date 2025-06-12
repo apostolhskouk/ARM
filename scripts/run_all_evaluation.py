@@ -22,12 +22,12 @@ import argparse
 BENCHMARK_DIR = Path("assets/all_data/benchmarks_subsampled")
 BENCHMARK_FILENAMES = [
     #"bird.json", 
-    #"fetaqa.json", 
+    "fetaqa.json", 
     "feverous.json", 
-    #"mt_raig.json",
-    #"multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
-    #"table_bench.json",
-    #"bird_schema.json", "spider_schema.json"
+    "mt_raig.json",
+    "multi_hop_rag.json", "ottqa.json", "spider.json", "tabfact.json",
+    "table_bench.json",
+    "bird_schema.json", "spider_schema.json"
 ]
 METADATA_FIELDS_TO_INDEX = ["page_title", "source"]
 FIELD_TO_INDEX = "object"
@@ -38,8 +38,8 @@ RETRIEVERS_CONFIG: Dict[str, Type[BaseRetriever]] = {
     #"DenseRerank": DenseRetrieverWithReranker,
     #"DenseDecomp": DenseRetrieverWithDecomposition,
     #"DenseDecompRerank": DenseRetrieverWithDecompositionAndReranker,
-    "ARM": ARMRetriever,
-    #"ReAct": ReActRetriever,
+    #"ARM": ARMRetriever,
+    "ReAct": ReActRetriever,
     #"Colbert": PylateColbertRetriever,
 }
 
@@ -50,10 +50,10 @@ QWEN_INDEX_BASE_DIR = Path("assets/all_data/indexes/dense_qwen_3")
 ARM_INDEX_BASE_DIR = Path("assets/all_data/indexes/arm_retriever")
 EVALUATION_N_VALUES = [1, 3, 5, 10]
 RETRIEVAL_K = 300
-WANDB_PROJECT_NAME = "all_benchmarks"
-WANDB_ENTITY_NAME = ""
+WANDB_PROJECT_NAME = "all_benchmarks_SHIT"
+WANDB_ENTITY_NAME = "lakhs"
 
-DECOMPOSITION_MODEL_NAME = "gemma3:1b"
+DECOMPOSITION_MODEL_NAME = "Qwen/Qwen2.5-72B-Instruct-AWQ"
 DECOMPOSITION_CACHE_FOLDER = "assets/all_decompositions/"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 REACT_LLM_MODEL_PATH = "assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ"
@@ -98,14 +98,14 @@ def main():
                 embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
                 decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER,
-                use_vllm=False
+                use_vllm=True
             )
         elif retriever_name == "DenseDecompRerank":
             retriever_instance = RetrieverClass(
                 embedding_model_name=EMBEDDING_MODEL,
                 model_name=DECOMPOSITION_MODEL_NAME,
                 decomposition_cache_folder=DECOMPOSITION_CACHE_FOLDER,
-                use_vllm=False
+                use_vllm=True
             )
         elif retriever_name == "ReAct":
             retriever_instance = RetrieverClass(
@@ -118,7 +118,10 @@ def main():
                 ngram_llm_model_path=ARM_NGRAM_LLM_MODEL_PATH,
                 embedding_model_name=EMBEDDING_MODEL,
                 vllm_tensor_parallel_size=1,
-                expansion_steps=0
+                expansion_steps=0,
+                use_reranker_instead_of_mip=True,
+                mip_k_select = 50,
+                generate_n_grams=True,
             )
         elif retriever_name == "Colbert":
             retriever_instance = RetrieverClass()
@@ -131,6 +134,7 @@ def main():
             benchmark_filepath = BENCHMARK_DIR / benchmark_filename
 
             run_name = f"{retriever_name}-{benchmark_stem}"
+            #run_name = f"{retriever_name}-{benchmark_stem}-qwen-72-reranker-50-output-with-ngrams"
             group_name = f"retriever-{retriever_name}-100"
             
             config_dict = {
@@ -173,11 +177,12 @@ def main():
                     field_to_index=FIELD_TO_INDEX,
                     metadata_fields=METADATA_FIELDS_TO_INDEX
                 )
-                retrieved_results_nested_list: List[List[RetrievalResult]] = retriever_instance.retrieve(
+                retrieved_results_nested_list: List[List[List[RetrievalResult]]] = retriever_instance.retrieve(
                     nlqs=queries,
                     output_folder=output_folder,
                     k=RETRIEVAL_K
                 )
+
             else:
                 k_temp = RETRIEVAL_K
                 if benchmark_stem.endswith("_schema"):
@@ -195,45 +200,93 @@ def main():
                 "retrieval_time_seconds": retrieval_time,
                 "queries_per_second": num_queries / retrieval_time if retrieval_time > 0 else 0
             })
-
-            predicted_doc_ids_list = [[f"{res.metadata['page_title']}_{res.metadata['source']}" for res in inner_list] for inner_list in retrieved_results_nested_list]
+            if not is_agentic_retriever:
+                predicted_doc_ids_list = [[f"{res.metadata['page_title']}_{res.metadata['source']}" for res in inner_list] for inner_list in retrieved_results_nested_list]
 
             if is_agentic_retriever:
-                avg_distinct, avg_calls = retriever_instance.display_metrics(verbose=False)
-                avg_distinct = avg_distinct if avg_distinct is not None else 0
+                mip_input_results = []
+                mip_output_results = []
+                final_selection_results = []
+
+                for query_results in retrieved_results_nested_list:
+                    # Each query_results is a list: [mip_input_list, mip_output_list, final_selection_list]
+                    if len(query_results) == 3:
+                        mip_input_results.append(query_results[0])
+                        mip_output_results.append(query_results[1])
+                        final_selection_results.append(query_results[2])
+
+                # --- 2. Log the global agentic metrics (calls and final distinct objects) ---
+                # These metrics are calculated by the retriever instance for the final agentic step.
+                avg_distinct_final, avg_calls = retriever_instance.display_metrics(verbose=True)
+                avg_distinct_final = avg_distinct_final if avg_distinct_final is not None else 0
                 avg_calls = avg_calls if avg_calls is not None else 0
 
                 wandb.log({
-                    f"agentic_avg_distinct_retrieved_objects": avg_distinct,
+                    f"agentic_avg_distinct_retrieved_objects": avg_distinct_final,
                     f"agentic_avg_llm_search_calls": avg_calls
                 })
-                
-                metrics_at_k_for_eval = evaluator.calculate_metrics_for_single_n(
-                    ground_truth_ids=ground_truth_ids_list,
-                    predicted_ids=predicted_doc_ids_list,
-                    n_value=RETRIEVAL_K*2
-                )
 
-                agentic_summary_df_data = {
-                    "#calls ↓": [avg_calls],
-                    "Avg #obj. ↓": [avg_distinct],
-                    "P @avg_obj": [metrics_at_k_for_eval.get("Precision", 0.0) * 100.0],
-                    "R @avg_obj": [metrics_at_k_for_eval.get("Recall", 0.0) * 100.0],
-                    "F1 @avg_obj": [metrics_at_k_for_eval.get("F1", 0.0) * 100.0],
-                    "PR @avg_obj": [metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0],
-                    "k_for_eval": [RETRIEVAL_K*2]
+                # --- 3. Loop through each stage to calculate and log metrics ---
+                # We create a dictionary to iterate over, making the code clean and reusable.
+                results_to_evaluate = {
+                    "mip_input": mip_input_results,
+                    "mip_output": mip_output_results,
+                    "final_selection": final_selection_results
                 }
-                agentic_summary_df = pd.DataFrame(agentic_summary_df_data)
-                
-                wandb.log({f"agentic_summary_table/{benchmark_stem}": wandb.Table(dataframe=agentic_summary_df)})
-                
-                wandb.log({
-                    f"agentic_{benchmark_stem}_P_at_avg_obj": metrics_at_k_for_eval.get("Precision", 0.0) * 100.0,
-                    f"agentic_{benchmark_stem}_R_at_avg_obj": metrics_at_k_for_eval.get("Recall", 0.0) * 100.0,
-                    f"agentic_{benchmark_stem}_F1_at_avg_obj": metrics_at_k_for_eval.get("F1", 0.0) * 100.0,
-                    f"agentic_{benchmark_stem}_PR_at_avg_obj": metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0,
-                    f"agentic_{benchmark_stem}_k_for_eval": RETRIEVAL_K*2,
-                })
+                print(f"Final selecedtion results: {final_selection_results}")
+                for stage_name, current_stage_results in results_to_evaluate.items():
+                    print(f"\n--- Calculating metrics for stage: {stage_name} ---")
+
+                    # Convert RetrievalResult objects to the ID format your evaluator expects
+                    predicted_doc_ids_list = [
+                        [f"{res.metadata['page_title']}_{res.metadata['source']}" for res in inner_list]
+                        for inner_list in current_stage_results
+                    ]
+
+                    # Calculate the average number of objects for THIS specific stage
+                    num_queries = len(current_stage_results)
+                    if num_queries > 0:
+                        avg_objects_for_stage = sum(len(p_ids) for p_ids in predicted_doc_ids_list) / num_queries
+                    else:
+                        avg_objects_for_stage = 0
+                    
+                    print(f"Average objects at this stage: {avg_objects_for_stage:.2f}")
+
+                    # Calculate precision, recall, etc.
+                    # Note: The evaluation is run at a fixed k (RETRIEVAL_K*2), not at the average number of objects.
+                    # The table headers like "P @avg_obj" are kept for consistency with your original code.
+                    metrics_at_k_for_eval = evaluator.calculate_metrics_for_single_n(
+                        ground_truth_ids=ground_truth_ids_list,
+                        predicted_ids=predicted_doc_ids_list,
+                        n_value=RETRIEVAL_K * 2
+                    )
+
+                    # Create the summary DataFrame for the current stage
+                    summary_df_data = {
+                        "#calls ↓": [avg_calls],  # LLM calls are the same for all stages of a single run
+                        "Avg #obj. ↓": [avg_objects_for_stage], # Use the average for the current stage
+                        "P @k": [metrics_at_k_for_eval.get("Precision", 0.0) * 100.0],
+                        "R @k": [metrics_at_k_for_eval.get("Recall", 0.0) * 100.0],
+                        "F1 @k": [metrics_at_k_for_eval.get("F1", 0.0) * 100.0],
+                        "PR @k": [metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0],
+                        "k_for_eval": [RETRIEVAL_K * 2]
+                    }
+                    summary_df = pd.DataFrame(summary_df_data)
+                    
+                    # Log the summary table to wandb with a stage-specific name
+                    wandb.log({f"summary_table/{stage_name}_{benchmark_stem}": wandb.Table(dataframe=summary_df)})
+                    
+                    # Log individual metrics to wandb with stage-specific names
+                    wandb.log({
+                        f"{stage_name}_{benchmark_stem}_P_at_k": metrics_at_k_for_eval.get("Precision", 0.0) * 100.0,
+                        f"{stage_name}_{benchmark_stem}_R_at_k": metrics_at_k_for_eval.get("Recall", 0.0) * 100.0,
+                        f"{stage_name}_{benchmark_stem}_F1_at_k": metrics_at_k_for_eval.get("F1", 0.0) * 100.0,
+                        f"{stage_name}_{benchmark_stem}_PR_at_k": metrics_at_k_for_eval.get("Perfect Recall", 0.0) * 100.0,
+                        f"{stage_name}_{benchmark_stem}_avg_objects": avg_objects_for_stage,
+                        f"{stage_name}_{benchmark_stem}_k_for_eval": RETRIEVAL_K * 2,
+                    })
+
+                    print(f"Logged metrics for {stage_name} to W&B.")
 
             else:
                 results_df = evaluator.calculate_metrics(
