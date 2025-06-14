@@ -245,10 +245,10 @@ This will download the data into the `assets/` directory. You can explore `asset
 
 ### 4. Download the huggingface model for the ReAct implementation
 
-The implementation of the ReAct agent is based on guidance with Transformers, however you need to pre-download the model. For our experiments we use Qwen2.5-32B-Instruct, since this was the easiest modern model to setup around 30B parameters. To download it as expected by the scripts you can run :
+The implementation of the ReAct agent is based on guidance with Transformers, however you need to pre-download the model. For our experiments we use Qwen2.5-72B-Instruct. To download it as expected by the scripts you can run :
 
 ```bash
-huggingface-cli download Qwen/Qwen2.5-32B-Instruct-AWQ --local-dir assets/cache/Qwen/Qwen2.5-32B-Instruct-AWQ --local-dir-use-symlinks False
+huggingface-cli download Qwen/Qwen2.5-72B-Instruct-AWQ --local-dir assets/cache/Qwen/Qwen2.5-72B-Instruct-AWQ --local-dir-use-symlinks False
 ```
 
 ## 🧪 Running the Experiments
@@ -433,7 +433,7 @@ An agentic retriever that iteratively searches.
 from src.retrieval.react import ReActRetriever
 retriever = ReActRetriever(
     dense_model_name_or_path="infly/inf-retriever-v1-1.5b",
-    model_path="Qwen2.5-32B-Instruct-Q4_K_M.gguf"
+    model_path="assets/cache/Qwen/Qwen2.5-72B-Instruct-AWQ"
 )
 ```
 
