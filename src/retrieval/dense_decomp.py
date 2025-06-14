@@ -27,7 +27,8 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         else:
             self.decomposer = VLLMQueryDecomposer(
                 model_name_or_path=model_name,
-                output_folder=decomposition_cache_folder
+                output_folder=decomposition_cache_folder,
+                gpu_memory_utilization = 0.65
             )
 
     def retrieve(
@@ -37,76 +38,69 @@ class DenseRetrieverWithDecomposition(FaissDenseRetriever):
         k: int
     ) -> List[List[RetrievalResult]]:
         """
-        Decomposes all queries, retrieves results for all sub-queries,
-        then combines and returns top-k per original query based on voting.
+        Decomposes all queries, retrieves for original + sub-queries,
+        then combines and returns top-k per original query using Reciprocal Rank Fusion (RRF).
         """
         if not nlqs:
             return []
 
+        # 1. Decompose queries and include the original query in the retrieval set
+        all_queries_to_retrieve: List[str] = []
+        original_query_indices: List[int] = []
+
         if self.use_vllm:
             decomposed_nlqs_batch: List[List[str]] = self.decomposer.decompose_batch(nlqs)
-    
-            all_sub_queries: List[str] = []
-            original_query_indices: List[int] = []
-
-            for i, single_nlq_decompositions in enumerate(decomposed_nlqs_batch):
-                current_s_queries = single_nlq_decompositions if single_nlq_decompositions else [nlqs[i]]
-
-                for sub_q in current_s_queries:
-                    all_sub_queries.append(sub_q)
+            for i, sub_queries in enumerate(decomposed_nlqs_batch):
+                # Key Change: Add the original query to the list of queries to run
+                queries_for_this_nlq = [nlqs[i]] + sub_queries
+                for q in queries_for_this_nlq:
+                    all_queries_to_retrieve.append(q)
                     original_query_indices.append(i)
-
         else:
-    
-            all_sub_queries: List[str] = []
-            original_query_indices: List[int] = []
-
             for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
-                sub_queries = self.decomposer.decompose(nlq) or [nlq]
-                for sub_q in sub_queries:
-                    all_sub_queries.append(sub_q)
+                sub_queries = self.decomposer.decompose(nlq) or []
+                queries_for_this_nlq = [nlq] + sub_queries
+                for q in queries_for_this_nlq:
+                    all_queries_to_retrieve.append(q)
                     original_query_indices.append(i)
 
-        if not all_sub_queries:
+        if not all_queries_to_retrieve:
             return [[] for _ in nlqs]
 
-        # 2. Retrieve for all sub-queries in one batch call (Keep this part the same)
-        all_sub_results_nested = super().retrieve(all_sub_queries, output_folder, k)
+        # 2. Retrieve for all queries (original + sub-queries) in one batch call
+        all_retrieved_results_nested = super().retrieve(all_queries_to_retrieve, output_folder, k)
 
-        # 3. Re-group results and count occurrences (votes) by original query index
-        # Store counts and one representative RetrievalResult per unique object
-        grouped_votes: Dict[int, Dict[str, Tuple[int, RetrievalResult]]] = {i: {} for i in range(len(nlqs))}
+        # 3. Fuse results using Reciprocal Rank Fusion (RRF)
+        rrf_k = 60  # RRF constant
+        grouped_results: Dict[int, Dict[str, Dict]] = {i: {} for i in range(len(nlqs))}
 
-        for sub_query_idx, sub_results in enumerate(all_sub_results_nested):
-            original_idx = original_query_indices[sub_query_idx]
-            current_group_votes = grouped_votes[original_idx]
-            for r in sub_results:
-                object_key = r.object # Assume r.object is the unique identifier (e.g., text or ID)
-                if object_key not in current_group_votes:
-                    # First time seeing this object for this original query
-                    current_group_votes[object_key] = (1, r) # Store count = 1 and the result object
+        for query_idx, single_query_results in enumerate(all_retrieved_results_nested):
+            original_idx = original_query_indices[query_idx]
+            
+            for rank, r in enumerate(single_query_results, 1):
+                object_key = r.object
+                rrf_score = 1 / (rrf_k + rank)
+
+                if object_key not in grouped_results[original_idx]:
+                    grouped_results[original_idx][object_key] = {
+                        'score': rrf_score,
+                        'result_obj': r
+                    }
                 else:
-                    # Increment vote count, keep the existing representative result object
-                    count, existing_result = current_group_votes[object_key]
-                    current_group_votes[object_key] = (count + 1, existing_result)
+                    grouped_results[original_idx][object_key]['score'] += rrf_score
 
-        # 4. Select top-k based on votes for each original query
+        # 4. Select top-k based on final RRF scores
         final_batches: List[List[RetrievalResult]] = []
         for i in range(len(nlqs)):
-            # Get the dictionary of {object_key: (vote_count, result_obj)} for the current query
-            results_with_votes = grouped_votes[i]
+            results_with_scores = grouped_results[i].values()
 
-            # Sort items by vote count (descending)
-            # items() gives [(key, (count, result)), ...]
-            # We sort by item[1][0] which is the count
-            sorted_by_votes = sorted(
-                results_with_votes.items(),
-                key=lambda item: item[1][0],
+            sorted_by_score = sorted(
+                results_with_scores,
+                key=lambda item: item['score'],
                 reverse=True
             )
 
-            # Extract the RetrievalResult objects from the top-k voted items
-            top_k_results = [result_obj for key, (count, result_obj) in sorted_by_votes[:k]]
+            top_k_results = [item['result_obj'] for item in sorted_by_score[:k]]
             final_batches.append(top_k_results)
 
         return final_batches

@@ -1,19 +1,23 @@
 from typing import List, Optional,Dict
 from src.retrieval.base import RetrievalResult
-from src.retrieval.dense_rerank import DenseRetrieverWithReranker
+from src.retrieval.dense import FaissDenseRetriever
 from src.utils.query_decompostion import QueryDecomposer
 from src.utils.query_decomposition_vllm import QueryDecomposer as VLLMQueryDecomposer
-
+from mxbai_rerank import MxbaiRerankV2
+import torch
 from tqdm import tqdm
 
 
-class DenseRetrieverWithDecompositionAndReranker(DenseRetrieverWithReranker):
+class DenseRetrieverWithDecompositionAndReranker(FaissDenseRetriever):
     """
-    Combines query decomposition with dense retrieval + reranking.
-    For each original query:
-      1. Decompose into sub-queries.
-      2. Batch dense-retrieve + rerank all sub-queries in one call.
-      3. Flatten, sort, and return top-k.
+    Implements an advanced retrieval pipeline with full reranking.
+    This strategy prioritizes maximum quality over performance.
+    1. Decomposes a query into sub-queries.
+    2. Gathers a large set of candidates using fast dense retrieval for the original
+       query and all sub-queries.
+    3. Aggregates and deduplicates all candidates.
+    4. Reranks the ENTIRE set of unique candidates using a powerful cross-encoder
+       against the original query to get the final results.
     """
     def __init__(
         self,
@@ -23,10 +27,10 @@ class DenseRetrieverWithDecompositionAndReranker(DenseRetrieverWithReranker):
         decomposition_cache_folder: Optional[str] = None,
         use_vllm: bool = True
     ):
-        super().__init__(
-            embedding_model_name=embedding_model_name,
-            reranker_model_name=reranker_model_name
-        )
+        super().__init__(model_name_or_path=embedding_model_name)
+        self.reranker = MxbaiRerankV2(reranker_model_name, device_map="cuda:1")
+        self._reranker_model_name = reranker_model_name
+
         self.use_vllm = use_vllm
         if not self.use_vllm:
             self.decomposer = QueryDecomposer(
@@ -43,68 +47,88 @@ class DenseRetrieverWithDecompositionAndReranker(DenseRetrieverWithReranker):
         self,
         nlqs: List[str],
         output_folder: str,
-        k: int
+        k: int,
     ) -> List[List[RetrievalResult]]:
         """
-        Decomposes all queries, retrieves+reranks results for all sub-queries
-        in one batch call, then combines and returns top-k per original query.
+        Executes the full retrieval and reranking pipeline without RRF.
         """
         if not nlqs:
             return []
 
-        # 1. Decompose all queries first
+        # === STAGE 1: DECOMPOSITION & CANDIDATE GATHERING ===
+        all_queries_to_retrieve: List[str] = []
+        original_query_indices: List[int] = []
+
         if self.use_vllm:
             decomposed_nlqs_batch: List[List[str]] = self.decomposer.decompose_batch(nlqs)
-    
-            all_sub_queries: List[str] = []
-            original_query_indices: List[int] = []
-
-            for i, single_nlq_decompositions in enumerate(decomposed_nlqs_batch):
-                current_s_queries = single_nlq_decompositions if single_nlq_decompositions else [nlqs[i]]
-
-                for sub_q in current_s_queries:
-                    all_sub_queries.append(sub_q)
+            for i, sub_queries in enumerate(decomposed_nlqs_batch):
+                queries_for_this_nlq = [nlqs[i]] + sub_queries
+                for q in queries_for_this_nlq:
+                    all_queries_to_retrieve.append(q)
                     original_query_indices.append(i)
-
         else:
-    
-            all_sub_queries: List[str] = []
-            original_query_indices: List[int] = []
-
-            for i, nlq in enumerate(tqdm(nlqs, desc=f"Decomposing with {self.decomposer.ollama_model}")):
-                sub_queries = self.decomposer.decompose(nlq) or [nlq]
-                for sub_q in sub_queries:
-                    all_sub_queries.append(sub_q)
+            for i, nlq in enumerate(tqdm(nlqs, desc="Decomposing queries")):
+                sub_queries = self.decomposer.decompose(nlq) or []
+                queries_for_this_nlq = [nlq] + sub_queries
+                for q in queries_for_this_nlq:
+                    all_queries_to_retrieve.append(q)
                     original_query_indices.append(i)
 
-
-        if not all_sub_queries:
+        if not all_queries_to_retrieve:
             return [[] for _ in nlqs]
 
-        # 2. Retrieve + Rerank for all sub-queries in one batch call
-        # It returns List[List[RetrievalResult]], one list per sub_query
-        all_sub_results_nested = super().retrieve(all_sub_queries, output_folder, k)
+        candidate_results_nested = super().retrieve(
+            all_queries_to_retrieve, output_folder, k
+        )
 
-        # 3. Re-group results by original query index
-        grouped_results: Dict[int, List[RetrievalResult]] = {i: [] for i in range(len(nlqs))}
-        seen_texts_per_query: Dict[int, set] = {i: set() for i in range(len(nlqs))}
+        # === STAGE 2: AGGREGATE AND DEDUPLICATE CANDIDATES ===
+        # We collect all unique documents in a dictionary to deduplicate.
+        deduplicated_candidates: Dict[int, Dict[str, RetrievalResult]] = {i: {} for i in range(len(nlqs))}
 
-        for sub_query_idx, sub_results in enumerate(all_sub_results_nested):
-            original_idx = original_query_indices[sub_query_idx]
-            current_seen = seen_texts_per_query[original_idx]
-            for r in sub_results:
-                # 4. Deduplicate within each original query's results
-                if r.object not in current_seen:
-                    current_seen.add(r.object)
-                    grouped_results[original_idx].append(r)
+        for query_idx, single_query_results in enumerate(candidate_results_nested):
+            original_nlq_idx = original_query_indices[query_idx]
+            for r in single_query_results:
+                # The dictionary key handles deduplication automatically.
+                deduplicated_candidates[original_nlq_idx][r.object] = r
 
-        # 5. Sort and take top-k for each original query
+        # === STAGE 3: FULL RERANKING OF ALL UNIQUE CANDIDATES ===
         final_batches: List[List[RetrievalResult]] = []
-        for i in range(len(nlqs)):
-            results_for_query = grouped_results[i]
-            # Results from super().retrieve should already be reranked and sorted
-            # But we aggregate from multiple sub-queries, so we must resort
-            results_for_query.sort(key=lambda x: x.score, reverse=True)
-            final_batches.append(results_for_query[:k])
+        torch.cuda.empty_cache()
+
+        for i, nlq in enumerate(tqdm(nlqs, desc=f"Full reranking with {self._reranker_model_name}")):
+            unique_candidates_map = deduplicated_candidates[i]
+            if not unique_candidates_map:
+                final_batches.append([])
+                continue
+            
+            # Prepare the full list of unique document texts for the reranker
+            docs_to_rerank = list(unique_candidates_map.keys())
+
+            try:
+                # Rerank the ENTIRE deduplicated set against the ORIGINAL query
+                reranked_output = self.reranker.rank(
+                    query=nlq,
+                    documents=docs_to_rerank,
+                    top_k=k,
+                    return_documents=True,
+                    batch_size=32 
+                )
+
+                reranked_results: List[RetrievalResult] = []
+                for item in reranked_output:
+                    # Retrieve the original result object to preserve metadata
+                    original_result = unique_candidates_map.get(item.document)
+                    if original_result:
+                        reranked_results.append(RetrievalResult(
+                            object=item.document,
+                            score=float(item.score),
+                            metadata=original_result.metadata
+                        ))
+                
+                final_batches.append(reranked_results)
+
+            except Exception as e:
+                print(f"ERROR during full reranking for query '{nlq[:50]}...': {e}.")
+                final_batches.append([])
 
         return final_batches

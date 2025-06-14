@@ -12,7 +12,7 @@ class QueryDecomposer:
                  output_folder: Optional[str] = None,
                  tensor_parallel_size: int = 2,
                  quantization: Optional[str] = None,
-                 gpu_memory_utilization: float = 0.75,
+                 gpu_memory_utilization: float = 0.70,
                  enable_prefix_caching: bool = True,
                  trust_remote_code: bool = True,
                  max_tokens: int = 4096,
@@ -42,7 +42,8 @@ class QueryDecomposer:
             gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            download_dir="/data/hdd1/vllm_models/"
+            download_dir="/data/hdd1/vllm_models/",
+            max_model_len=4096
         )
         self.sampling_params = SamplingParams(
             temperature=temperature,

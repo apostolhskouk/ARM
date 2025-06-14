@@ -11,7 +11,6 @@ from tqdm.auto import tqdm
 
 import guidance
 from guidance import models, gen, select, assistant
-import traceback 
 
 REACT_PROMPT_TEMPLATE = """Solve a question answering task with interleaving Thought, Action, Observation steps. A Thought step must be followed by a Action step, an Action step must be followed by an Observation step (unless Action is Finish), and an Observation step must be followed by a Thought step. Thought can reason about the current situation. Action can be of two types:
 (1) Search[keyword], which returns relevant documents or tables. Use precise keywords based on your thought process.
@@ -172,7 +171,8 @@ class ReActRetriever(FaissDenseRetriever):
                  dense_model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
                  model_path: str = "unsloth/gemma-3-27b-it-bnb-4bit",
                  max_iterations: int = 5,
-                 k_react_search: int = 5,
+                 k_sources_to_show: int = 3, # New parameter for number of sources
+                 source_retrieval_multiplier: int = 5, # Multiplier to get enough candidates
                  llm_n_ctx: int = 32768,
                  ):
         """
@@ -183,13 +183,15 @@ class ReActRetriever(FaissDenseRetriever):
 
         self.model_path = model_path
         self.max_iterations = max_iterations
-        self.k_react_search = k_react_search
+        self.k_sources_to_show = k_sources_to_show
+        # Calculate how many individual items to retrieve per search step
+        self.k_react_search = self.k_sources_to_show * source_retrieval_multiplier
         self.llm_n_ctx = llm_n_ctx
 
-        self.guidance_lm = None 
+        self.guidance_lm = None
 
         # Metrics storage
-        self.distinct_retrieved_counts_per_query: List[int] = []
+        self.distinct_retrieved_counts_per_query: List[int] = [] # This will now count sources
         self.llm_search_calls_per_query: List[int] = []
 
         if not hasattr(self, 'device'):
@@ -197,7 +199,35 @@ class ReActRetriever(FaissDenseRetriever):
 
         # --- Initialize Guidance LLM ---
         self._initialize_guidance_llm()
+        
+    def _group_and_sort_by_source(self, results: Set[RetrievalResult]) -> List[Tuple[str, List[RetrievalResult]]]:
+        """
+        Groups retrieval results by source, and sorts the groups by the max score within each group.
+        """
+        if not results:
+            return []
 
+        # Group results by source
+        grouped_by_source: Dict[str, List[RetrievalResult]] = {}
+        for res in results:
+            source = res.metadata.get('source', 'Unknown Source')
+            if source not in grouped_by_source:
+                grouped_by_source[source] = []
+            grouped_by_source[source].append(res)
+        
+        # Create a list of tuples (source, results_list, max_score) for sorting
+        sorted_groups_with_score = sorted(
+            [
+                (source, res_list, max(r.score for r in res_list))
+                for source, res_list in grouped_by_source.items()
+            ],
+            key=lambda x: x[2],  # Sort by the max_score
+            reverse=True
+        )
+
+        # Return a list of (source, results_list) tuples without the score
+        return [(source, res_list) for source, res_list, _ in sorted_groups_with_score]
+    
     def _initialize_guidance_llm(self):
         """Initializes the Guidance LLM model."""
         if self.guidance_lm is not None:
@@ -223,22 +253,40 @@ class ReActRetriever(FaissDenseRetriever):
 
 
     def _format_observation(self, results: List[RetrievalResult]) -> str:
+        """
+        Groups results by source, truncates to the top k sources, 
+        and formats them into a consolidated observation string for the LLM.
+        """
         if not results:
             return "No relevant documents found."
 
+        # Group and sort all retrieved items by source
+        # We pass a set to the helper to handle potential duplicates from the input list
+        sorted_groups = self._group_and_sort_by_source(set(results))
+        
+        # Truncate to the desired number of sources
+        truncated_groups = sorted_groups[:self.k_sources_to_show]
+
+        if not truncated_groups:
+            return "No relevant documents found."
+
         obs_parts = []
-        for res in results:
-            page_title = res.metadata.get('page_title', 'Unknown Page')
-            source = res.metadata.get('source', 'Unknown Source')
-            content = getattr(res, 'object', 'No Content')
-            content = str(content) if not isinstance(content, str) else content
+        for source, source_results in truncated_groups:
+            # All results in a group should share the same page_title
+            page_title = source_results[0].metadata.get('page_title', 'Unknown Page')
+            
+            # Consolidate the content ('object') from all items in the group
+            # This handles both sentences and table rows effectively
+            content_parts = [str(res.object).strip() for res in source_results]
+            merged_content = "\n".join(content_parts)
 
             part = (f"page_title: {page_title}\n"
                     f"source: {source}\n"
-                    f"object: {page_title} [SEP] {content.strip()}")
+                    f"object: {page_title} [SEP] {merged_content}")
             obs_parts.append(part)
 
-        return "\n".join(obs_parts)
+        # Join the formatted source blocks with double newlines for clarity
+        return "\n\n".join(obs_parts)
 
 
     def retrieve(self,
@@ -402,11 +450,21 @@ class ReActRetriever(FaissDenseRetriever):
             )
 
             # --- Store results and metrics for the successfully processed query ---
-            # Append collected results (unique across all search steps for this query)
-            all_final_results.append(list(collected_results_this_query))
-            self.distinct_retrieved_counts_per_query.append(len(collected_results_this_query))
-            # Log the total search calls made for this query
-            print(collected_results_this_query,flush=True)
+            sorted_groups = self._group_and_sort_by_source(collected_results_this_query)
+            
+            # Truncate to the top k sources
+            final_groups = sorted_groups[:self.k_sources_to_show]
+
+            # Flatten the results from the top-k groups into a single list for evaluation
+            final_results_for_query = [
+                result for _, result_list in final_groups for result in result_list
+            ]
+            
+            all_final_results.append(final_results_for_query)
+            
+            # Update metrics: count the number of distinct SOURCES retrieved
+            num_sources_retrieved = len(final_groups)
+            self.distinct_retrieved_counts_per_query.append(num_sources_retrieved)
             self.llm_search_calls_per_query.append(search_call_counter['count'])
 
         return all_final_results

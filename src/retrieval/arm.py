@@ -21,7 +21,8 @@ from nltk.corpus import stopwords
 from src.utils.mip_solver import MIPSolver
 import numpy as np
 import time
-
+from mxbai_rerank import MxbaiRerankV2
+from collections import defaultdict
 class ARMRetriever(BaseRetriever):
     FAISS_INDEX_FILENAME = "index.faiss"
     FAISS_METADATA_FILENAME = "metadata.pkl"
@@ -30,23 +31,25 @@ class ARMRetriever(BaseRetriever):
                 vllm_model_path: str,
                 ngram_llm_model_path :str,
                 embedding_model_name: str = "BAAI/bge-m3",
-                keyword_extraction_beams: int = 3,
+                keyword_extraction_beams: int = 5,
                 mip_k_select: int = 30,
-                compatibility_semantic_weight: float = 0.7,
-                compatibility_exact_weight: float = 0.3,
+                compatibility_semantic_weight: float = 0.99,
+                compatibility_exact_weight: float = 0.01,
                 corpus_ngram_min_len: int = 1, 
                 corpus_ngram_max_len: int = 3, 
-                generate_n_grams:bool = True,
-                expansion_k_compatible: int = 3,
+                generate_n_grams:bool = False,
+                expansion_k_compatible: int = 5,
                 expansion_steps: int = 1,
                 keyword_rephrasing_beams: int = 3,
                 vllm_tensor_parallel_size: int = 2,
                 vllm_cache_dir: str = "/data/hdd1/vllm_models/",
                 vllm_quantization: Optional[str] = None,
-                filter_ngrams_against_corpus: bool = True,
                 arm_cache_dir: str = "assets/arm/",
                 keywords_per_query: int = 20,
-                alignment_retrieval_k: int = 5,
+                alignment_retrieval_k: int = 20,
+                use_reranker_instead_of_mip: bool = False,
+                final_llm_selection_beams: int = 1,
+                dense_instead_of_sparse : bool = True
                 ) -> None:
 
         self.embedding_model_name = embedding_model_name
@@ -57,7 +60,7 @@ class ARMRetriever(BaseRetriever):
         self.corpus_ngram_min_len = corpus_ngram_min_len # Renamed
         self.corpus_ngram_max_len = corpus_ngram_max_len
         self.indexed_field: Optional[str] = None
-        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
@@ -89,7 +92,6 @@ class ARMRetriever(BaseRetriever):
         self.vllm_quantization = vllm_quantization
         
         self.valid_corpus_ngrams_set: Set[str] = set() # New: For storing word-based corpus n-grams
-        self.filter_ngrams_against_corpus = filter_ngrams_against_corpus # New
         self.arm_cache_dir = arm_cache_dir
         self.stop_words_set = set(stopwords.words('english'))
         self.keywords_per_query = keywords_per_query
@@ -100,6 +102,46 @@ class ARMRetriever(BaseRetriever):
         self.expansion_steps = expansion_steps
         self.all_queries_processed: int = 0
         self.all_items_returned: int = 0
+        self.use_reranker_instead_of_mip = use_reranker_instead_of_mip
+        self.reranker = None
+        self.final_llm_selection_beams = final_llm_selection_beams
+        self.dense_instead_of_sparse = dense_instead_of_sparse
+    @staticmethod
+    def _convert_dicts_to_retrieval_results(objects: List[Dict]) -> List[RetrievalResult]:
+        results = []
+        if not objects:
+            return results
+        for obj_data in objects:
+            results.append(
+                RetrievalResult(
+                    score=obj_data.get('relevance_score_R_i', 1.0),
+                    object=obj_data['text'],
+                    metadata=obj_data['metadata']
+                )
+            )
+        return results
+
+    @staticmethod
+    def parse_qwen3_output(raw_output_text):
+        """
+        Parses the raw output from Qwen3 (potentially with thinking tags)
+        to extract the final content.
+        """
+        think_end_tag = "</think>"
+        # Find the *last* occurrence of the closing tag
+        last_tag_index = raw_output_text.rfind(think_end_tag)
+
+        if last_tag_index != -1:
+            # If tag found, content starts after the tag
+            content_start_index = last_tag_index + len(think_end_tag)
+            final_content = raw_output_text[content_start_index:]
+        else:
+            # If no tag found, assume the whole output is the content
+            final_content = raw_output_text
+
+        # Strip leading/trailing whitespace and newlines
+        return final_content.strip()
+    
     def _initialize_vllm(self): 
         tokenizer = AutoTokenizer.from_pretrained(self.vllm_model_path, trust_remote_code=True, cache_dir=self.vllm_cache_dir)
         if tokenizer.pad_token is None:
@@ -111,14 +153,12 @@ class ARMRetriever(BaseRetriever):
                 tokenizer=tokenizer.name_or_path,
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
-                gpu_memory_utilization=0.80, 
-                max_model_len=16384,
+                gpu_memory_utilization=0.68, 
+                max_model_len=22048,
             )
         else:
             print("vLLM model path not provided. Skipping vLLM initialization.")
-            
-            
-                        
+
     def _initialize_ngram_llm_and_build_trie(self, input_jsonl_path_for_ngrams: str, field_for_ngrams: str):
         if not self.ngram_llm_model_path: return
         self.ngram_llm_tokenizer = AutoTokenizer.from_pretrained(self.ngram_llm_tokenizer_path,cache_dir=self.vllm_cache_dir, trust_remote_code=True)
@@ -235,6 +275,9 @@ class ARMRetriever(BaseRetriever):
                  k: int) -> List[List[RetrievalResult]]:
         self.bm25_index_path = output_folder[0]
         self.faiss_index_path = output_folder[1]
+        if self.use_reranker_instead_of_mip:
+            if self.reranker is None:
+                self.reranker = MxbaiRerankV2('mixedbread-ai/mxbai-rerank-large-v2',device='cuda:1')
         self.mip_solver = MIPSolver(
             embedding_model=self.embedding_model,
             faiss_dense_retriever=self.faiss_dense_retriever,
@@ -265,43 +308,43 @@ class ARMRetriever(BaseRetriever):
     @staticmethod
     def _get_final_selection_prompt(user_query: str, keywords_string: str, serialized_objects: str) -> str:
         return textwrap.dedent(f"""
-            You are given a user question and a pre-assembled list of candidate objects. Your goal is to pick the smallest set of objects that fully answer the question.
+You are a meticulous research assistant. You are given a user question and a pre-assembled list of candidate objects. Your primary goal is to identify and select **every object** that is relevant to the user's question. Your selection should be **comprehensive** to avoid missing any potentially useful information.
 
-            **Formatting rules:**
-            - Each candidate object must appear on its own line, beginning with `Id:`  
-            - When listing your chosen IDs, separate them with commas (e.g. `id1,id2,id3`; spaces are allowed but must be consistent)  
-            - Close your response with the terminator `<>` on its own line  
+**Guiding Principles:**
+1.  **Prioritize Recall over Precision:** It is much better to include a moderately relevant object than to accidentally exclude a crucial one. When in doubt, include the object.
+2.  **Value Context:** Select objects that provide useful background or context, even if they don't contain the direct answer. Information that helps build a complete picture is valuable.
+3.  **Assume Pre-filtered Candidates:** The list of objects has already been filtered for potential relevance. Your task is to perform the final, careful selection from this list.
 
-            **Few-shot example:**
+**Formatting Rules:**
+-   List your chosen IDs separated by commas (e.g., `id1,id2,id3`).
+-   Close your response with the terminator `<>` on a new line.
 
-            User question: What was the lead single from the album 'Echoes of Tomorrow' by The Cosmic Rays, and in what year was this album released?  
-            The relevant keywords are:  
-            lead single | album 'Echoes of Tomorrow' | The Cosmic Rays | year released
+**Example Task:**
 
-            Here are the objects that can be relevant to answer the user query:
-            Id: 'sentence_0' : Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
-            Id: 'sentence_1' : The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
-            Id: 'table_0' : Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
-            Id: 'sentence_2' : Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
-            Id: 'table_1' : Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
-            Id: 'sentence_3' : Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
-            Id: 'table_2' : The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
-            Id: 'sentence_4' : Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
+User question: What was the lead single from the album 'Echoes of Tomorrow' by The Cosmic Rays, and in what year was this album released?
 
-            From the above objects, here are the IDs of those that are enough to answer the query:
-            sentence_0,table_0
-            <>
+Here are the objects that can be relevant to answer the user query:
+Id: 'sentence_1' : Echoes of Tomorrow [SEP] The critically acclaimed album 'Echoes of Tomorrow' by The Cosmic Rays featured 'Starlight Serenade' as its lead single, captivating audiences worldwide.
+Id: 'sentence_2' : The Cosmic Rays [SEP] The Cosmic Rays are a band primarily known for their energetic live performances and their earlier hit 'Nebula Blues' from the album 'Celestial Journey'.
+Id: 'table_1' : Echoes of Tomorrow [SEP] [H] Album Details: [H] Artist: The Cosmic Rays , [H] Release Year: 2018 , [H] Genre: Psychedelic Rock , [H] Record Label: Nebula Records
+Id: 'sentence_3' : Starlight Serenade [SEP] 'Starlight Serenade' is a popular song by The Cosmic Rays, often performed live and was recorded during their 2018 studio sessions.
+Id: 'table_2' : Celestial Journey [SEP] [H] Album: Celestial Journey , [H] Artist: The Cosmic Rays , [H] Release Year: 2016 , [H] Lead Single: Comet Tail
+Id: 'sentence_4' : Music Reviews [SEP] 'Echoes of Tomorrow' received widespread acclaim, though some critics noted its departure from the band's earlier sound.
+Id: 'table_3' : The Cosmic Rays [SEP] [H] Member: Alex Chen , [H] Role: Vocals, Guitar , [H] Joined: 2015 [SEP] [H] Member: Zara Khan , [H] Role: Drums , [H] Joined: 2015
+Id: 'sentence_5' : Echoes of Tomorrow [SEP] The recording sessions for 'Echoes of Tomorrow' took place in early 2018, with the band experimenting with new synthesizers.
 
-            **Now it’s your turn.**
+Based on the principles of comprehensive selection, here are the IDs of all relevant and contextual objects:
+sentence_0,table_0,sentence_2,sentence_3,sentence_4,table_2
+<>
 
-            User question: {user_query}  
-            The relevant keywords are:  
-            {keywords_string}
+**Now it’s your turn.**
 
-            Here are the objects that can be relevant to answer the user query:
-            {serialized_objects}
+User question: {user_query}  
 
-            From the above objects, here are the IDs of those that are enough to answer the query:
+Here are the objects that can be relevant to answer the user query:
+{serialized_objects}
+
+From the above objects, here are the IDs of those that are enough to answer the query:
             """)
         
     def _get_keyword_generation_prompt_vllm(self, user_query: str) -> str:
@@ -315,6 +358,7 @@ class ARMRetriever(BaseRetriever):
             The relevant keywords are: latest album | Taylor Swift | release date
 
             User question: {user_query}
+            /no_think
             The relevant keywords are:""")
     
     
@@ -377,7 +421,7 @@ class ARMRetriever(BaseRetriever):
             keyword_prompt = self._get_keyword_generation_prompt_vllm(user_query)
             
             keyword_sampling_params = VLLM_SamplingParams(
-                temperature=1.0, 
+                temperature=0.7, 
                 max_tokens=150,  
                 stop=["\n", "<|eot_id|>", "The relevant n-grams are:"],
                 n=self.keyword_extraction_beams
@@ -386,7 +430,7 @@ class ARMRetriever(BaseRetriever):
             vllm_request_outputs = self.vllm_engine.generate([keyword_prompt], keyword_sampling_params,use_tqdm=False)
             
             for beam_completion_output in vllm_request_outputs[0].outputs:
-                generated_keywords_text = beam_completion_output.text.strip()
+                generated_keywords_text = self.parse_qwen3_output(beam_completion_output.text) #in case we use the thinking models of qwen
                 for stop_seq in keyword_sampling_params.stop:
                     if stop_seq in generated_keywords_text:
                         generated_keywords_text = generated_keywords_text.split(stop_seq, 1)[0].strip()
@@ -455,11 +499,18 @@ class ARMRetriever(BaseRetriever):
 
         # Step 5: Initial Retrieval (BM25 + FAISS)
         retrieved_docs_by_bm25_nested: List[List[RetrievalResult]] = []
-        retrieved_docs_by_bm25_nested = self.bm25_retriever.retrieve(
-            nlqs=self.current_ngrams_for_retrieval,
-            output_folder=self.bm25_index_path, 
-            k=self.alignment_retrieval_k
-        )
+        if self.dense_instead_of_sparse :
+            retrieved_docs_by_bm25_nested = self.faiss_dense_retriever.retrieve(
+                nlqs=self.current_ngrams_for_retrieval,
+                output_folder=self.faiss_index_path, 
+                k=self.alignment_retrieval_k
+            )
+        else:
+            retrieved_docs_by_bm25_nested = self.bm25_retriever.retrieve(
+                nlqs=self.current_ngrams_for_retrieval, 
+                output_folder=self.bm25_index_path, 
+                k=self.alignment_retrieval_k
+            )
         retrieved_docs_by_faiss: List[List[RetrievalResult]] = []
         retrieved_docs_by_faiss = self.faiss_dense_retriever.retrieve(
             nlqs=[user_query], 
@@ -471,7 +522,6 @@ class ARMRetriever(BaseRetriever):
         combined_initial_candidates = all_bm25_results_flat + faiss_results_for_query
 
         # Step 6: Deduplication
-        step6_start = time.time()
         unique_retrieved_objects_map = {}
         for res_item in combined_initial_candidates:
             current_meta = res_item.metadata if isinstance(res_item.metadata, dict) else {}
@@ -560,12 +610,18 @@ class ARMRetriever(BaseRetriever):
             for step in range(self.expansion_steps):
                 newly_added_in_this_step_list = []
                 expansion_queries = [base_obj['text'] for base_obj in current_candidates_to_expand_from if base_obj['text']]
-
-                bm25_expansion_results_nested = self.bm25_retriever.retrieve(
-                    nlqs=expansion_queries,
-                    output_folder=self.bm25_index_path,
-                    k=self.expansion_k_compatible
-                )
+                if self.dense_instead_of_sparse:
+                    bm25_expansion_results_nested = self.faiss_dense_retriever.retrieve(
+                        nlqs=expansion_queries,
+                        output_folder=self.faiss_index_path,
+                        k=self.expansion_k_compatible
+                    )
+                else:
+                    bm25_expansion_results_nested = self.bm25_retriever.retrieve(
+                        nlqs=expansion_queries,
+                        output_folder=self.bm25_index_path,
+                        k=self.expansion_k_compatible
+                    )
 
                 for i, base_obj_text_queried in enumerate(expansion_queries):
                     bm25_retrieved_for_this_base_obj = bm25_expansion_results_nested[i]
@@ -613,65 +669,87 @@ class ARMRetriever(BaseRetriever):
                 current_candidates_to_expand_from = newly_added_in_this_step_list
         final_mip_candidates = list(expanded_candidates_dict.values())
 
-        # Step 10: MIP Solving
         selected_objects_by_mip = []
-        if final_mip_candidates:
-            selected_objects_by_mip = self.mip_solver._solve_mip_object_selection(
-                candidate_objects=final_mip_candidates,
-                k_select=self.mip_k_select
-            )
+        if self.use_reranker_instead_of_mip:
+            if final_mip_candidates:
+                docs_to_rerank = [obj['text'] for obj in final_mip_candidates]
+                text_to_candidate_map = {obj['text']: obj for obj in final_mip_candidates}
+                reranked_results = self.reranker.rank(
+                    query=user_query,
+                    documents=docs_to_rerank,
+                    top_k=self.mip_k_select,  
+                    return_documents=True,
+                    batch_size=2
+                )
+
+                for item in reranked_results:
+                    doc_text = item.document
+                    if doc_text in text_to_candidate_map:
+                        original_object = text_to_candidate_map[doc_text]
+                        original_object['relevance_score_R_i'] = item.score
+                        selected_objects_by_mip.append(original_object)
+                    else:
+                        print(f"Warning: Reranked document text not found in candidate map: {doc_text}")
+        else:
+            if final_mip_candidates:
+                selected_objects_by_mip = self.mip_solver._solve_mip_object_selection(
+                    candidate_objects=final_mip_candidates,
+                    k_select=self.mip_k_select
+                )
         
         llm_id_to_original_data_map = {}
-        serialized_objects = str()
+        serialized_objects = ""
         sentence_counter = 1
         table_counter = 1
 
+        # 1. Group objects by their source (page_title, source_info)
+        grouped_objects = defaultdict(list)
         for obj_data_item in selected_objects_by_mip:
-            # Step 1: Construct the string that would have been used to form the old 'object_llm_id'.
-            # This string is checked for "sentence_" or "table_" to determine the simple ID type.
             meta = obj_data_item.get('metadata', {})
-            # Use obj_data_item['id'] (the true unique ID from upstream) for more robust fallback titles/sources
-            page_title = meta.get('page_title', f"untitled_{obj_data_item['id']}")
-            source_info = meta.get('source', f"unknownsrc_{obj_data_item['id']}")
-            
-            # This is the string to check for "sentence_" or "table_" clues.
-            # It's based on the old logic for object_llm_id.
-            id_to_check_for_type_clues = f"{page_title}_{source_info}".replace(" ", "_").replace(":", "_").replace("/", "_").lower()
+            # Use a tuple of (page_title, source) as the unique key for a group
+            group_key = (
+                meta.get('page_title', f"untitled_{obj_data_item['id']}"),
+                meta.get('source', f"unknownsrc_{obj_data_item['id']}")
+            )
+            grouped_objects[group_key].append(obj_data_item)
 
-            simple_llm_id = None # Initialize
+        # 2. Iterate over the groups to create a single, combined entry for each
+        for group_key, object_group in grouped_objects.items():
+            if not object_group:
+                continue
 
-            # Step 2: Determine the simple ID based on the content of id_to_check_for_type_clues
-            if "sentence_" in id_to_check_for_type_clues:
-                simple_llm_id = f"sentence_{sentence_counter}"
-                sentence_counter += 1
-            elif "table_" in id_to_check_for_type_clues:
+            # Use the first object in the group to determine the type (table/passage)
+            first_obj = object_group[0]
+            source_type = first_obj.get('source_type')
+
+            # Determine the simple LLM ID for the entire group
+            simple_llm_id = None
+            if source_type == 'table':
                 simple_llm_id = f"table_{table_counter}"
                 table_counter += 1
+            elif source_type == 'passage':
+                simple_llm_id = f"sentence_{sentence_counter}"
+                sentence_counter += 1
             else:
-                # Fallback: If the constructed ID string doesn't contain "sentence_" or "table_",
-                # we can check 'source_type' from the object data as a more robust indicator.
-                source_type = obj_data_item.get('source_type')
-                if source_type == 'passage': # Assuming 'passage' corresponds to 'sentence'
-                    simple_llm_id = f"sentence_{sentence_counter}"
-                    sentence_counter += 1
-                elif source_type == 'table':
-                    simple_llm_id = f"table_{table_counter}"
-                    table_counter += 1
-                else:
-                    # If the object cannot be categorized as 'sentence' or 'table'
-                    # it will be excluded from LLM selection under the new simple ID scheme.
-                    print(f"Warning: Object with original ID '{obj_data_item['id']}' "
-                          f"(checked string: '{id_to_check_for_type_clues}', source_type: {source_type}) "
-                          f"could not be mapped to 'sentence_X' or 'table_X'. "
-                          f"It will be excluded from LLM selection with a simple ID.")
-                    continue # Skip this object and do not include it in the prompt
+                print(f"Warning: Group with key '{group_key}' has unknown source_type '{source_type}'. Skipping.")
+                continue
 
-            # Step 3: Store mapping and build serialized string for prompt
-            # The key for the map is the new simple_llm_id.
-            # The value is the original object data, which contains the original complex ID ('id')
-            # and all other necessary information.
-            llm_id_to_original_data_map[simple_llm_id] = obj_data_item
-            serialized_objects += f"Id: '{simple_llm_id}' : {obj_data_item['text']}\n"
+            # 3. Combine the text of all objects in the group
+            combined_text = ""
+            if source_type == 'table':
+                # For tables, take the title from the first row and combine all row data.
+                # This avoids repeating the title part.
+                title_part = first_obj['text'].split(' [SEP] ', 1)[0]
+                row_parts = [obj['text'].split(' [SEP] ', 1)[1] for obj in object_group if ' [SEP] ' in obj['text']]
+                combined_text = f"{title_part} [SEP] {' [SEP] '.join(row_parts)}"
+            else:  # 'passage'
+                # For sentences, simply join them with a space to form a coherent paragraph.
+                combined_text = " ".join([obj['text'] for obj in object_group])
+
+            # 4. Store mapping and build the serialized string for the prompt
+            # The map now points from the simple ID to the *list* of original objects
+            llm_id_to_original_data_map[simple_llm_id] = object_group
+            serialized_objects += f"Id: '{simple_llm_id}' : {combined_text}\n"
             
         serialized_keywords = " | ".join(self.current_keywords)
         selection_prompt = self._get_final_selection_prompt(
@@ -680,22 +758,32 @@ class ARMRetriever(BaseRetriever):
             serialized_objects=serialized_objects 
         )
         selection_sampling_params = VLLM_SamplingParams(
-            temperature=0.0,          # deterministic
-            max_tokens=150,
-            stop=["<>"],              # stop when the terminator is emitted
+            n=self.final_llm_selection_beams,
+            temperature=0.7,          
+            max_tokens=256,
+            stop=["<>"],             
         )
-        vllm_outputs = self.vllm_engine.generate([selection_prompt], selection_sampling_params,use_tqdm=False)
-        raw_llm_output = vllm_outputs[0].outputs[0].text
-        # llm_selected_string_ids will contain simple IDs like "sentence_1", "table_3"
-        llm_selected_simple_ids = self.parse_selected_ids(raw_llm_output) 
-
+        
+        vllm_outputs = self.vllm_engine.generate([selection_prompt], selection_sampling_params, use_tqdm=False)
+        
+        all_selected_ids_from_beams = []
+        # Iterate over the outputs from all beams
+        for beam_completion_output in vllm_outputs[0].outputs:
+            raw_llm_output = self.parse_qwen3_output(beam_completion_output.text)
+            # Parse the simple IDs (e.g., "sentence_1", "table_3") from this beam's output
+            ids_from_beam = self.parse_selected_ids(raw_llm_output)
+            all_selected_ids_from_beams.extend(ids_from_beam)
+            
+        # Deduplicate the list of IDs while preserving the order of first appearance
+        llm_selected_simple_ids = list(dict.fromkeys(all_selected_ids_from_beams))
         final_selected_objects_list = []
         # llm_selected_simple_ids now contains the simple IDs (e.g., "sentence_1", "table_1")
         # that the LLM selected.
         for simple_id_str in llm_selected_simple_ids:
             # Use the new map to look up the original object data using the simple ID.
             if simple_id_str in llm_id_to_original_data_map:
-                final_selected_objects_list.append(llm_id_to_original_data_map[simple_id_str])
+                # Use extend since the map now contains a LIST of original objects for each ID
+                final_selected_objects_list.extend(llm_id_to_original_data_map[simple_id_str])
             else:
                 # This can happen if LLM hallucinates an ID or if parse_selected_ids is imperfect
                 # or if an object was skipped during simple ID generation but LLM still tried to pick it.
@@ -704,7 +792,7 @@ class ARMRetriever(BaseRetriever):
                 
         self.all_items_returned += len(final_selected_objects_list)
         self.all_queries_processed += 1
-        return final_selected_objects_list
+        return final_selected_objects_list # final_mip_candidates, selected_objects_by_mip
     
     def display_metrics(self, verbose=True) -> Tuple[float, float]:
         avg_llm_calls = 1.0
