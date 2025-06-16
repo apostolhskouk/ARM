@@ -153,7 +153,7 @@ def react_guidance_program(lm, question: str, max_rounds: int, search_func: Call
         lm = lm.set('final_action', last_act) 
     if final_arg:
         lm = lm.set('final_argument', final_arg) 
-
+    print(f"Full ReAct Program Output:\n{lm}")
     return lm
 
     
@@ -171,8 +171,8 @@ class ReActRetriever(FaissDenseRetriever):
                  dense_model_name_or_path: str = "WhereIsAI/UAE-Large-V1",
                  model_path: str = "unsloth/gemma-3-27b-it-bnb-4bit",
                  max_iterations: int = 5,
-                 k_sources_to_show: int = 3, # New parameter for number of sources
-                 source_retrieval_multiplier: int = 5, # Multiplier to get enough candidates
+                 k_sources_to_show: int = 5,
+                 source_retrieval_multiplier: int = 20, 
                  llm_n_ctx: int = 32768,
                  ):
         """
@@ -332,7 +332,7 @@ class ReActRetriever(FaissDenseRetriever):
         try:
             if self.device == 'cuda' and faiss.get_num_gpus() > 0:
                 res = faiss.StandardGpuResources()
-                index_to_search = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+                index_to_search = faiss.index_cpu_to_gpu(res,0, index_cpu)
             else:
                  raise RuntimeError("CUDA device requested but not available, or no GPUs found.")
         except Exception as e:

@@ -57,7 +57,7 @@ class ARMRetriever(BaseRetriever):
         self.mip_k_select = mip_k_select
         self.compatibility_semantic_weight = compatibility_semantic_weight
         self.compatibility_exact_weight = compatibility_exact_weight
-        self.corpus_ngram_min_len = corpus_ngram_min_len # Renamed
+        self.corpus_ngram_min_len = corpus_ngram_min_len 
         self.corpus_ngram_max_len = corpus_ngram_max_len
         self.indexed_field: Optional[str] = None
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -91,7 +91,7 @@ class ARMRetriever(BaseRetriever):
         self.vllm_cache_dir = vllm_cache_dir
         self.vllm_quantization = vllm_quantization
         
-        self.valid_corpus_ngrams_set: Set[str] = set() # New: For storing word-based corpus n-grams
+        self.valid_corpus_ngrams_set: Set[str] = set()
         self.arm_cache_dir = arm_cache_dir
         self.stop_words_set = set(stopwords.words('english'))
         self.keywords_per_query = keywords_per_query
@@ -153,7 +153,7 @@ class ARMRetriever(BaseRetriever):
                 tokenizer=tokenizer.name_or_path,
                 download_dir=self.vllm_cache_dir,
                 quantization=self.vllm_quantization,
-                gpu_memory_utilization=0.68, 
+                gpu_memory_utilization=0.72, 
                 max_model_len=22048,
             )
         else:
@@ -674,22 +674,28 @@ From the above objects, here are the IDs of those that are enough to answer the 
             if final_mip_candidates:
                 docs_to_rerank = [obj['text'] for obj in final_mip_candidates]
                 text_to_candidate_map = {obj['text']: obj for obj in final_mip_candidates}
-                reranked_results = self.reranker.rank(
-                    query=user_query,
-                    documents=docs_to_rerank,
-                    top_k=self.mip_k_select,  
-                    return_documents=True,
-                    batch_size=2
-                )
-
-                for item in reranked_results:
-                    doc_text = item.document
-                    if doc_text in text_to_candidate_map:
-                        original_object = text_to_candidate_map[doc_text]
-                        original_object['relevance_score_R_i'] = item.score
-                        selected_objects_by_mip.append(original_object)
-                    else:
-                        print(f"Warning: Reranked document text not found in candidate map: {doc_text}")
+                try:
+                    reranked_results = self.reranker.rank(
+                        query=user_query,
+                        documents=docs_to_rerank,
+                        top_k=self.mip_k_select,  
+                        return_documents=True,
+                        batch_size=2
+                    )
+                    for item in reranked_results:
+                        doc_text = item.document
+                        if doc_text in text_to_candidate_map:
+                            original_object = text_to_candidate_map[doc_text]
+                            original_object['relevance_score_R_i'] = item.score
+                            selected_objects_by_mip.append(original_object)
+                        else:
+                            print(f"Warning: Reranked document text not found in candidate map: {doc_text}")
+                except: #fallback to mip
+                    print("Reranker failed, falling back to MIP solver.")
+                    selected_objects_by_mip = self.mip_solver._solve_mip_object_selection(
+                        candidate_objects=final_mip_candidates,
+                        k_select=self.mip_k_select
+                    )
         else:
             if final_mip_candidates:
                 selected_objects_by_mip = self.mip_solver._solve_mip_object_selection(
