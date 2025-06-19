@@ -1,6 +1,6 @@
 # ARM Paper Reproduction for Database Systems
 
-This repository contains the project for the **Database Systems** course, part of the MSc in Data Science & Information Technologies (Class of 2025).
+This repository contains the project for the **Database Systems** course, part of the MSc in Data Science & Information Technologies (Class of 2025, Spring).
 
 Make sure you read the [Technical Report](./ARM_technical_report.pdf) to understand the context and the implemented methods.
 
